@@ -70,6 +70,7 @@ class BootstrapView(Resource):
                 except exceptions.NoClientError:
                     client, token = extensions.auth_service.bootstrap_anonymous_user()
                     session["oauth_client"] = client.client_id
+                    
             # Check if the client_id is valid and that there is no client/user mismatch
             if not client_id or (
                 client.user_id != current_user.get_id()
