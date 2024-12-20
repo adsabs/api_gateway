@@ -14,10 +14,9 @@ from flask_restful import Resource, abort
 from flask_wtf.csrf import generate_csrf
 from sqlalchemy import or_
 from werkzeug.security import gen_salt
-from exceptions import NoClientError
 
 from apigateway import email_templates as templates
-from apigateway import extensions, schemas
+from apigateway import extensions, schemas, exceptions
 from apigateway.models import (
     EmailChangeRequest,
     OAuth2Client,
@@ -68,7 +67,7 @@ class BootstrapView(Resource):
             if client_id:
                 try:
                     client, token = extensions.auth_service.load_client(client_id)
-                except NoClientError:
+                except exceptions.NoClientError:
                     client, token = extensions.auth_service.bootstrap_anonymous_user()
                     session["oauth_client"] = client.client_id
             # Check if the client_id is valid and that there is no client/user mismatch
