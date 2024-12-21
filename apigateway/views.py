@@ -125,6 +125,7 @@ class UserAuthView(Resource):
             try:
                 schemas.PasswordValidator()(params.password)
             except:  # noqa
+                current_app.logger.info("Forcing generation of password reset token for user: {}".format(user.id))
                 token: str = extensions.security_service.generate_password_token(user.id)
                 send_password_reset_email(token, user.email)
                 
