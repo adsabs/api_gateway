@@ -15,7 +15,7 @@ import requests
 from authlib.integrations.flask_oauth2 import current_token, token_authenticated
 from authlib.integrations.sqla_oauth2 import create_bearer_token_validator
 from cachelib.serializers import RedisSerializer
-from flask import Flask, g, request
+from flask import Flask, g, request, current_app
 from flask.wrappers import Response
 from flask_caching import Cache
 from flask_limiter import Limiter
@@ -1279,6 +1279,7 @@ class SecurityService(GatewayService, Security):
 
         if user_id is None:
             user_id = current_user.id
+        current_app.logger.info("Generating password token for user: {}".format(user_id))
 
         return self.generate_token(user_id, salt=self.get_service_config("VERIFY_PASSWORD_SALT"))
 
