@@ -497,7 +497,7 @@ class UserInfoView(Resource):
     """
 
     decorators = [
-        extensions.limiter_service.shared_limit("500/43200 second"),
+        #extensions.limiter_service.shared_limit("500/43200 second"),
         extensions.auth_service.require_oauth("adsws:internal"),
     ]
 
