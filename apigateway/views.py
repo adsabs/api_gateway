@@ -127,6 +127,8 @@ class UserAuthView(Resource):
             except:  # noqa
                 token: str = extensions.security_service.generate_password_token()
                 send_password_reset_email(token, user.email)
+                
+                current_app.logger.info("Forcing password reset for user {}".format(user.email))
 
                 abort(
                     422,
