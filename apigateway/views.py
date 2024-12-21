@@ -213,7 +213,7 @@ class UserManagementView(Resource):
 
             token = extensions.security_service.generate_email_token(user.id)
             send_welcome_email(token, user.email)
-
+            current_app.logger.info("Sent Welcome email for user: {}".format(user.email))
             return {"message": "success"}, 200
         except ValueError as e:
             return {"error": str(e)}, 400
@@ -289,6 +289,7 @@ class ResetPasswordView(Resource):
                 self._delete_existing_password_change_requests(session, user.id)
                 self._create_password_change_request(session, token, user.id)
 
+                current_app.logger.info("Sent password reset email for user: {}".format(token_or_email))
                 send_password_reset_email(token, token_or_email)
 
             return {"message": "success"}, 200
