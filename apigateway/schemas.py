@@ -21,7 +21,7 @@ class PasswordValidator(Validator):
 
     def __call__(self, value: str) -> str:
         if len(value) < 8:
-            raise ValidationError("Password must be at least 4 characters long")
+            raise ValidationError("Password must be at least 8 characters long")
 
         if not self.PASSWORD_REGEX.match(value):
             raise ValidationError(
