@@ -127,6 +127,8 @@ class UserAuthView(Resource):
             except:  # noqa
                 current_app.logger.info("Forcing generation of password reset token for user: {}".format(user.id))
                 token: str = extensions.security_service.generate_password_token(user.id)
+                self._delete_existing_password_change_requests(session, user.id)
+                self._create_password_change_request(session, token, user.id)
                 send_password_reset_email(token, user.email)
                 
                 current_app.logger.info("Forcing password reset for user {}".format(user.email))
@@ -150,7 +152,17 @@ class UserAuthView(Resource):
             session.commit()
 
         return {"message": "Successfully logged in"}, 200
+    
+    def _delete_existing_password_change_requests(self, session, user_id: int):
+        session.query(PasswordChangeRequest).filter(
+            PasswordChangeRequest.user_id == user_id
+        ).delete()
 
+    def _create_password_change_request(self, session, token: str, user_id: int):
+        password_change_request = PasswordChangeRequest(token=token, user_id=user_id)
+
+        session.add(password_change_request)
+        session.commit()
 
 class CSRFView(Resource):
     """
