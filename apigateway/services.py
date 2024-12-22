@@ -1340,7 +1340,7 @@ class SecurityService(GatewayService, Security):
                 "{0} verification token not validated. Reason: {1}".format(token, ex)
             )
             raise ValueError("unknown verification token")
-
+        current_app.logger.info("Verifying token for user: {}".format(user_id))
         user: User = User.query.filter_by(id=user_id).first()
 
         if user is None:
