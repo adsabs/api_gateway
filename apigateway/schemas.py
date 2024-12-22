@@ -20,7 +20,7 @@ class PasswordValidator(Validator):
     PASSWORD_REGEX = re.compile(r"^(?=.*[A-Z])(?=.*[a-z])(?=.*\d).+$")
 
     def __call__(self, value: str) -> str:
-        if len(value) < 4:
+        if len(value) < 8:
             raise ValidationError("Password must be at least 4 characters long")
 
         if not self.PASSWORD_REGEX.match(value):
