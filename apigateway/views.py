@@ -533,7 +533,7 @@ class UserInfoView(Resource):
         ## Input data can be a session, a access token or a user id
         # 1) Try to treat input data as a session
         try:
-            session_data = self._decodeFlaskCookie(account_data)
+            session_data = self._decodeFlaskCookie(account_data)      
             if "oauth_client" in session_data:
                 # Anonymous users always have their oauth_client id in the session
                 token = OAuth2Token.query.filter(
