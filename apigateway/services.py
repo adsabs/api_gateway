@@ -427,9 +427,9 @@ class ProxyService(GatewayService):
             self._logger.error("Could not fetch resource document for %s: %s", base_url, ex)
             return
 
-        self._logger.debug("Discovered %s endpoints:", deploy_path)
+        self._logger.info("Discovered %s endpoints:", deploy_path)
         for remote_path, properties in resource_json.items():
-            self._logger.debug("- %s", remote_path)
+            self._logger.info("- %s", remote_path)
 
             properties.setdefault(
                 "rate_limit",
@@ -506,7 +506,7 @@ class ProxyService(GatewayService):
             return response.json()
         except requests.exceptions.RequestException as ex:
             if extensions.storage_service.has(resource_url):
-                self._logger.debug("Using cached resource document for %s", resource_url)
+                self._logger.info("Using cached resource document for %s", resource_url)
                 return extensions.storage_service.get(resource_url)
             else:
                 raise ex
@@ -657,7 +657,7 @@ class LimiterService(GatewayService, Limiter):
                         "per_second": values.get("per_second", per_second),
                     }
 
-                self._logger.debug(f'"{endpoint}" added to limiter group "{group}"')
+                self._logger.info(f'"{endpoint}" added to limiter group "{group}"')
                 self._symbolic_ratelimits[endpoint] = self._symbolic_ratelimits[group]
                 break
 
