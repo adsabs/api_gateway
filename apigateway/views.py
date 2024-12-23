@@ -620,7 +620,7 @@ class UserInfoView(Resource):
             hashlib.pbkdf2_hmac(
                 "sha256",
                 str(id).encode(),
-                current_app.secret_key.encode(),
+                str(current_app.secret_key).encode(),
                 10,
                 dklen=32,
             )
