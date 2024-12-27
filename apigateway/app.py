@@ -88,13 +88,13 @@ def register_hooks(app: Flask):
         """
         a = current_app
         if exception:
-            a.logger.exception("Request had exception: {}".format(exception))
+            current_app.logger.exception("Tearing down with exception: {}".format(exception))
         if 'sqlalchemy' in a.extensions: # could use self.db but let's be very careful
-            try: 
-             a.db.session.remove()
-             a.logger.info("Removing session")
-            except AttributeError as e:
-                a.logger.exception("Failled to remove session with error: {}".format(e))
+            sa = a.extensions['sqlalchemy']
+            if hasattr(sa, 'db') and hasattr(sa.db, 'session') and sa.db.session.is_active:
+                if bool(sa.db.session.dirty):
+                    a.logger.info("Removing session")
+                    sa.db.session.close() # db server will do rollback      
     return app
 
 
