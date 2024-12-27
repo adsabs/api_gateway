@@ -90,9 +90,8 @@ def register_hooks(app: Flask):
         if exception:
             a.logger.exception("Request had exception: {}".format(exception))
         if 'sqlalchemy' in a.extensions: # could use self.db but let's be very careful
-            sa = a.extensions['sqlalchemy']
             try: 
-             sa.session.remove()
+             a.db.session.remove()
              a.logger.info("Removing session")
             except AttributeError as e:
                 a.logger.exception("Failled to remove session with error: {}".format(e))
