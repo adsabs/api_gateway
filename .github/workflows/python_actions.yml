@@ -59,7 +59,7 @@ jobs:
 
     - name: Install dependencies
       run: |
-        pip install setuptools==67.7.1
+        pip install setuptools==67.7.1 wheel 
         pip install .
         pip install -e '.[dev]'
 
