@@ -9,8 +9,9 @@ env:
   PGDATABASE: gateway
   PGPASSWORD: password
   PGUSER: user
-  PGHOST: db
+  PGHOST: localhost
   PGPORT: 5432
+  SQLALCHEMY_DATABASE_URI: "postgresql://user:password@localhost:5432/gateway"
 
 jobs:
   build:
@@ -23,7 +24,7 @@ jobs:
           POSTGRES_DB: gateway
           POSTGRES_PASSWORD: password
           POSTGRES_USER: user
-          POSTGRES_HOST: db
+          POSTGRES_HOST: localhost
           POSTGRES_PORT: 5432
 
         ports:
