@@ -9,7 +9,7 @@ env:
   PGDATABASE: gateway
   PGPASSWORD: password
   PGUSER: user
-  PGHOST: localhost
+  PGHOST: db
   PGPORT: 5432
 
 jobs:
@@ -23,7 +23,7 @@ jobs:
           POSTGRES_DB: gateway
           POSTGRES_PASSWORD: password
           POSTGRES_USER: user
-          POSTGRES_HOST: localhost
+          POSTGRES_HOST: db
           POSTGRES_PORT: 5432
 
         ports:
