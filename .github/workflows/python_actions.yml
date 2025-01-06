@@ -12,6 +12,8 @@ env:
   PGHOST: localhost
   PGPORT: 5432
   SQLALCHEMY_DATABASE_URI: "postgresql://user:password@localhost:5432/gateway"
+  REDIS_SERVICE_URL: "redis://localhost:6379/0"
+  LIMITER_SERVICE_STORAGE_URI: "redis://localhost:6379/0"
 
 jobs:
   build:
