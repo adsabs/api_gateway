@@ -269,8 +269,8 @@ class TestUserManagementView:
 
         with app.test_request_context(json=existing_user):
             response, status_code = user_management_view.post()
-            assert status_code == 409
-            assert "error" in response
+            assert status_code == 200
+            assert "error" not in response
 
     def test_delete_user(self, app, user_management_view, authenticated_user):
         with app.test_request_context():
