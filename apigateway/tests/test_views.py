@@ -110,7 +110,7 @@ class TestUserAuthView:
 
     def test_post_successful_login(self, app, authenticated_user, user_auth_view):
         with app.test_request_context(
-            json={"email": authenticated_user.email, "password": "valid_password"}
+            json={"email": authenticated_user.email, "password": "Valid_password1"}
         ):
             _, status_code = user_auth_view.post()
 
