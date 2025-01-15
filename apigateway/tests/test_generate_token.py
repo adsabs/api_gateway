@@ -103,7 +103,7 @@ def test_create_client_and_metadata(mock_add_arguments, app, mock_regular_user, 
         mock_commit.assert_called_once()
 
 def test_get_token_no_tokens_found(mock_add_arguments, app, mock_regular_user, mock_client, mock_simple_token):
-    mock_simple_token.scopes = ["fake_scope_1", "fake_scope_2"]
+    mock_simple_token.scope = "fake_scope_1 fake_scope_2"
     with patch("apigateway.extensions.db.session.query") as mock_query, \
          patch("apigateway.extensions.db.session.add") as mock_add,  \
          patch("apigateway.extensions.db.session.commit") as mock_commit:
