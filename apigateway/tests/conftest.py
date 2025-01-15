@@ -172,7 +172,7 @@ def mock_add_arguments():
         mock_args.return_value.description = "Test Description"
         mock_args.return_value.name = "Test OAuth Client"
         mock_args.return_value.create_user = False
-        mock_args.return_value.scope = ["user", "api"]
+        mock_args.return_value.scopes = ["user", "api"]
         mock_args.return_value.is_personal = False
         yield mock_args
 

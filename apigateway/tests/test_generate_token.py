@@ -91,7 +91,7 @@ def test_create_client_and_metadata(mock_add_arguments, app, mock_regular_user, 
         created_client = mock_add.call_args[0][0]
         
         # Assert that the created client's attributes correspond to the args
-        assert created_client.user_id == mock_regular_user.id
+        assert created_client.user_id == mock_regular_user.get_id()
         assert created_client.ratelimit_multiplier == 1.0
         assert created_client.individual_ratelimit_multipliers is None
         assert created_client.client_metadata["client_name"] == mock_add_arguments.return_value.name
