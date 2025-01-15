@@ -124,8 +124,8 @@ def test_get_token_no_tokens_found(mock_add_arguments, app, mock_regular_user, m
         mock_add.assert_called()
         mock_commit.assert_called()
 
-        assert created_token.user_id == mock_regular_user.id
-        assert created_token.client_id == mock_client.client_id
+        assert created_token.user_id == mock_regular_user.get_id()
+        assert created_token.client_id == mock_client.id
         assert created_token.scope == mock_client.scope
         assert created_token.is_personal == mock_add_arguments.return_value.is_personal 
         assert created_token.is_internal == True 
