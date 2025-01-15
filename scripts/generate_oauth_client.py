@@ -93,7 +93,7 @@ def get_token():
            
             if not args.create_user:
                 sys.exit(f"User with email {args.user_email} not found, and --create-user was not specified. Exiting.")
-            u = User(email=args.user_email, active=True, fs_uniquifier=uuid.uuid4())
+            u = User(email=args.user_email, active=True, fs_uniquifier=uuid.uuid4().hex)
             db.session.add(u)
             db.session.commit()
         except MultipleResultsFound:
