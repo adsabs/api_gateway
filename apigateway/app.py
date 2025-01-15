@@ -87,14 +87,13 @@ def register_hooks(app: Flask):
         opens a new transaction (which never gets closed and is rolled back)
         """
         a = current_app
-        if exception:
-            current_app.logger.exception("Tearing down with exception: {}".format(exception))
         if 'sqlalchemy' in a.extensions: # could use self.db but let's be very careful
             sa = a.extensions['sqlalchemy']
             if hasattr(sa, 'db') and hasattr(sa.db, 'session') and sa.db.session.is_active:
                 if bool(sa.db.session.dirty):
-                    a.logger.info("Removing session")
-                    sa.db.session.close() # db server will do rollback      
+                    sa.db.session.close() # db server will do rollback
+                else:
+                    sa.db.session.commit() # normal situation        
     return app
 
 
