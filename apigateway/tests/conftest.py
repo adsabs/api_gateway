@@ -172,7 +172,7 @@ def mock_add_arguments():
         mock_args.return_value.description = "Test Description"
         mock_args.return_value.name = "Test OAuth Client"
         mock_args.return_value.create_user = False
-        mock_args.return_value.scopes = ["user", "api"]
+        mock_args.return_value.scope = ["user", "api"]
         mock_args.return_value.is_personal = False
         yield mock_args
 
@@ -181,5 +181,5 @@ def mock_simple_token():
     mock_token = MagicMock()
     mock_token.access_token = "access_token"
     mock_token.refresh_token = "refresh_token"
-    mock_token.scopes = ["user", "api"]
+    mock_token.scope = ["user", "api"]
     return mock_token
