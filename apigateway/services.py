@@ -15,7 +15,7 @@ import requests
 from authlib.integrations.flask_oauth2 import current_token, token_authenticated
 from authlib.integrations.sqla_oauth2 import create_bearer_token_validator
 from cachelib.serializers import RedisSerializer
-from flask import Flask, g, request, current_app
+from flask import Flask, current_app, g, request
 from flask.wrappers import Response
 from flask_caching import Cache
 from flask_limiter import Limiter
@@ -571,16 +571,31 @@ class LimiterService(GatewayService, Limiter):
 
         @app.after_request
         def _after_request_hook(response: Response):
-            processing_time: float = time.time() - g.request_start_time
+            processing_time: float = max(0.0, time.time() - g.request_start_time)
 
-            key: str = f"{self._name}//{self._key_func()}/time"
+            if processing_time > 30:
+                self._logger.warning(
+                    "Request to %s took %.2f seconds", request.path, processing_time
+                )
 
-            existing_value: float = float(extensions.storage_service.get(key) or -1)
-            if existing_value < 0:
-                extensions.storage_service.set(key, processing_time)
-            else:
-                mean_value = (existing_value + processing_time) / 2
-                extensions.storage_service.incrbyfloat(key, mean_value - existing_value)
+            key_time: str = f"{self._name}//{self._key_func()}/time"
+            key_count: str = f"{self._name}//{self._key_func()}/count"
+
+            existing_time: float = float(extensions.storage_service.get(key_time) or 0)
+            request_count: int = int(extensions.storage_service.get(key_count) or 0)
+
+            new_request_count = request_count + 1
+
+            # Reduce impact of the first 100 requests.
+            # After 100 requests, the weight is 0.1 for each new request.
+            weight = min(0.1, new_request_count / 1000)
+
+            # Calculate mean including weighted new request
+            total_time = existing_time * request_count + processing_time * weight
+            new_mean_time = total_time / new_request_count
+
+            extensions.storage_service.set(key_time, new_mean_time)
+            extensions.storage_service.set(key_count, new_request_count)
 
             return response
 
@@ -676,6 +691,9 @@ class LimiterService(GatewayService, Limiter):
             extensions.storage_service.delete(
                 f"{self._name}//{self._key_func(request_endpoint)}/time"
             )
+            extensions.storage_service.delete(
+                f"{self._name}//{self._key_func(request_endpoint)}/count"
+            )
 
     def _limit_and_check(
         self,
@@ -765,7 +783,7 @@ class LimiterService(GatewayService, Limiter):
             extensions.storage_service.get(f"{self._name}//{self._key_func()}/time") or 0
         )
 
-        return 1 #if processing_time_seconds <= 1 else int(2 ** (processing_time_seconds - 1))
+        return 1 if processing_time_seconds <= 1 else int(2 ** (processing_time_seconds - 1))
 
     def _key_func(self, request_endpoint=None) -> str:
         """Returns the key for the rate limit.
