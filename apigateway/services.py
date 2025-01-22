@@ -591,8 +591,9 @@ class LimiterService(GatewayService, Limiter):
             weight = min(0.1, new_request_count / 1000)
 
             # Calculate mean including weighted new request
-            total_time = existing_time * request_count + processing_time * weight
-            new_mean_time = total_time / new_request_count
+            new_mean_time = ((existing_time * request_count) + (processing_time * weight)) / (
+                request_count + weight
+            )
 
             extensions.storage_service.set(key_time, new_mean_time)
             extensions.storage_service.set(key_count, new_request_count)
