@@ -3,6 +3,7 @@
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -586,13 +587,16 @@ class LimiterService(GatewayService, Limiter):
 
             new_request_count = request_count + 1
 
-            # Reduce impact of the first 100 requests.
-            # After 100 requests, the weight is 0.1 for each new request.
-            weight = min(0.1, new_request_count / 1000)
+            # Start with a very low weight for the first 99 requests to prevent startup
+            # issues having a big impact on the cost.
+            if new_request_count < 100:
+                weight = 0.01
+            else:
+                weight = math.sqrt(new_request_count) / 100
 
             # Calculate mean including weighted new request
-            new_mean_time = ((existing_time * request_count) + (processing_time * weight)) / (
-                request_count + weight
+            new_mean_time = ((existing_time * new_request_count) + (processing_time * weight)) / (
+                new_request_count + weight
             )
 
             extensions.storage_service.set(key_time, new_mean_time)
