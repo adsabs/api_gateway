@@ -779,6 +779,9 @@ class LimiterService(GatewayService, Limiter):
         Returns:
             int: The cost for the rate limit.
         """
+        if not self.get_service_config("SCALING_COST_ENABLED", False):
+            return 1
+
         processing_time_seconds = float(
             extensions.storage_service.get(f"{self._name}//{self._key_func()}/time") or 0
         )
