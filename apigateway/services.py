@@ -791,7 +791,7 @@ class LimiterService(GatewayService, Limiter):
             extensions.storage_service.get(f"{self._name}//{self._key_func()}/time") or 0
         )
 
-        return 1 if processing_time_seconds <= 1 else int(2 ** (processing_time_seconds - 1))
+        return min(1 + int(processing_time_seconds - 1), 10)
 
     def _key_func(self, request_endpoint=None) -> str:
         """Returns the key for the rate limit.
