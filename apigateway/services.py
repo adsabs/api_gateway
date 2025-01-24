@@ -570,40 +570,6 @@ class LimiterService(GatewayService, Limiter):
         def _before_request_hook():
             g.request_start_time = time.time()
 
-        @app.after_request
-        def _after_request_hook(response: Response):
-            processing_time: float = max(0.0, time.time() - g.request_start_time)
-
-            if processing_time > 30:
-                self._logger.warning(
-                    "Request to %s took %.2f seconds", request.path, processing_time
-                )
-
-            key_time: str = f"{self._name}//{self._key_func()}/time"
-            key_count: str = f"{self._name}//{self._key_func()}/count"
-
-            existing_time: float = float(extensions.storage_service.get(key_time) or 0)
-            request_count: int = int(extensions.storage_service.get(key_count) or 0)
-
-            new_request_count = request_count + 1
-
-            # Start with a very low weight for the first 99 requests to prevent startup
-            # issues having a big impact on the cost.
-            if new_request_count < 100:
-                weight = 0.01
-            else:
-                weight = math.sqrt(new_request_count) / 100
-
-            # Calculate mean including weighted new request
-            new_mean_time = ((existing_time * new_request_count) + (processing_time * weight)) / (
-                new_request_count + weight
-            )
-
-            extensions.storage_service.set(key_time, new_mean_time)
-            extensions.storage_service.set(key_count, new_request_count)
-
-            return response
-
         def _token_authenticated(sender, token=None, **kwargs):
             client = OAuth2Client.query.filter_by(id=token.client_id).first()
             level = getattr(client, "ratelimit", 1.0) if client else 0.0
@@ -784,14 +750,54 @@ class LimiterService(GatewayService, Limiter):
         Returns:
             int: The cost for the rate limit.
         """
-        if not self.get_service_config("SCALING_COST_ENABLED", False):
-            return 1
 
-        processing_time_seconds = float(
-            extensions.storage_service.get(f"{self._name}//{self._key_func()}/time") or 0
-        )
+        self._calc_new_mean_time()
 
-        return min(1 + int(processing_time_seconds - 1), 10)
+        if self.get_service_config("SCALING_COST_ENABLED", False):
+
+            request_count = float(
+                extensions.storage_service.get(f"{self._name}//{self._key_func()}/count") or 0
+            )
+
+            if request_count > self.get_service_config("SCALING_COST_THRESHOLD", 100):
+
+                request_mean_time = float(
+                    extensions.storage_service.get(f"{self._name}//{self._key_func()}/time") or 0
+                )
+
+                request_time = getattr(g, "processing_time", 0)
+
+                if request_time <= request_mean_time:
+                    return 1
+
+                # Calculate the ratio of processing time to mean time
+                ratio = request_time / request_mean_time
+
+                # Calculate the cost based on the log2 of the ratio
+                #
+                # Example:
+                # 1 + log(1, 2) * 5 = 1 + 0 = 1
+                # 1 + log(2, 2) * 5 = 1 + 1 * 5 = 6
+                # 1 + log(3, 2) * 5 ≈ 1 + 1.585 * 5 ≈ 9.925
+                return 1 + min(int(math.log(ratio, 2) * 5), 9)
+
+        return 1
+
+    def _calc_new_mean_time(self):
+        processing_time: float = max(0.0, time.time() - g.request_start_time)
+
+        key_time: str = f"{self._name}//{self._key_func()}/time"
+        key_count: str = f"{self._name}//{self._key_func()}/count"
+
+        existing_time: float = float(extensions.storage_service.get(key_time) or 0)
+        request_count: int = int(extensions.storage_service.get(key_count) or 0)
+
+        new_mean_time = ((existing_time * request_count) + processing_time) / (request_count + 1)
+
+        extensions.storage_service.set(key_time, new_mean_time)
+        extensions.storage_service.set(key_count, request_count + 1)
+
+        g.processing_time = processing_time
 
     def _key_func(self, request_endpoint=None) -> str:
         """Returns the key for the rate limit.
