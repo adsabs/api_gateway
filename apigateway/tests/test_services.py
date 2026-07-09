@@ -1,7 +1,7 @@
 from unittest.mock import MagicMock, call
 
 import pytest
-from flask import request
+from flask import g, request
 
 from apigateway.exceptions import ValidationError
 from apigateway.models import OAuth2Client, OAuth2Token, User
@@ -123,6 +123,131 @@ class TestAuthService:
                 func()
 
             assert "X-api-uid" not in request.headers
+
+    def test_modality_header_ui_real_session(self, app, mock_regular_user):
+        @app.route("/test_modality_ui")
+        def view_modality_ui():
+            pass
+
+        with app.test_request_context("/test_modality_ui"):
+            # Manually call before_request functions
+            for func in app.before_request_funcs[None]:
+                func()
+
+            assert request.headers["X-Access-Modality"] == "ui"
+            assert len(request.headers.getlist("X-Access-Modality")) == 1
+
+    def test_modality_header_anon_bootstrap_session_not_ui(self, app, mock_anon_user):
+        # An anonymous bootstrap session is authenticated but NOT a real user.
+        mock_anon_user.is_authenticated = True
+
+        @app.route("/test_modality_anon")
+        def view_modality_anon():
+            pass
+
+        with app.test_request_context("/test_modality_anon"):
+            for func in app.before_request_funcs[None]:
+                func()
+
+            assert "X-Access-Modality" not in request.headers
+            # Existing behavior preserved: X-api-uid is still set for the anonymous session.
+            assert "X-api-uid" in request.headers
+
+    def test_modality_header_stripped_unauthenticated(self, app):
+        @app.route("/test_modality_stripped")
+        def view_modality_stripped():
+            pass
+
+        with app.test_request_context(
+            "/test_modality_stripped",
+            headers={"X-Access-Modality": "evil"},
+        ):
+            for func in app.before_request_funcs[None]:
+                func()
+
+            assert "X-Access-Modality" not in request.headers
+
+    def test_modality_header_api_token_any_client(self, app, mock_regular_user, mock_client):
+        mock_regular_user.is_authenticated = False
+        mock_client.client_name = "ADS API client"
+        mock_token = MagicMock(user=mock_regular_user, client=mock_client)
+
+        with app.test_request_context("/test_modality_api"):
+            g.pop("access_modality", None)  # no session verdict for token-only path
+            app.auth_service._token_authenticated(sender=None, token=mock_token)
+
+            assert request.headers["X-Access-Modality"] == "api"
+            assert len(request.headers.getlist("X-Access-Modality")) == 1
+
+    def test_modality_header_api_token_bb_client_name(self, app, mock_regular_user, mock_client):
+        mock_regular_user.is_authenticated = False
+        mock_client.client_name = "BB client"
+        mock_token = MagicMock(user=mock_regular_user, client=mock_client)
+
+        with app.test_request_context("/test_modality_bb"):
+            g.pop("access_modality", None)  # no session verdict for token-only path
+            app.auth_service._token_authenticated(sender=None, token=mock_token)
+
+            assert request.headers["X-Access-Modality"] == "api"
+            assert len(request.headers.getlist("X-Access-Modality")) == 1
+
+    def test_modality_header_session_overrides_token(self, app, mock_regular_user, mock_client):
+        mock_client.client_name = "ADS API client"
+        mock_token = MagicMock(user=mock_regular_user, client=mock_client)
+
+        @app.route("/test_modality_session_wins")
+        def view_modality_session_wins():
+            pass
+
+        with app.test_request_context("/test_modality_session_wins"):
+            for func in app.before_request_funcs[None]:
+                func()
+            app.auth_service._token_authenticated(sender=None, token=mock_token)
+
+            assert request.headers["X-Access-Modality"] == "ui"
+            assert len(request.headers.getlist("X-Access-Modality")) == 1
+
+    def test_modality_header_spoof_cannot_override_session(self, app, mock_regular_user):
+        @app.route("/test_modality_spoof_session")
+        def view_modality_spoof_session():
+            pass
+
+        with app.test_request_context(
+            "/test_modality_spoof_session",
+            headers={"X-Access-Modality": "api"},
+        ):
+            for func in app.before_request_funcs[None]:
+                func()
+
+            assert request.headers["X-Access-Modality"] == "ui"
+            assert len(request.headers.getlist("X-Access-Modality")) == 1
+
+    def test_modality_header_spoof_cannot_override_token(self, app, mock_regular_user, mock_client):
+        mock_regular_user.is_authenticated = False
+        mock_client.client_name = "ADS API client"
+        mock_token = MagicMock(user=mock_regular_user, client=mock_client)
+
+        @app.route("/test_modality_spoof_token")
+        def view_modality_spoof_token():
+            pass
+
+        with app.test_request_context(
+            "/test_modality_spoof_token",
+            headers={"X-Access-Modality": "ui"},
+        ):
+            g.pop("access_modality", None)  # token-only: no leaked session verdict
+            for func in app.before_request_funcs[None]:
+                func()
+            app.auth_service._token_authenticated(sender=None, token=mock_token)
+
+            assert request.headers["X-Access-Modality"] == "api"
+            assert len(request.headers.getlist("X-Access-Modality")) == 1
+
+    def test_modality_header_token_none_no_crash(self, app):
+        with app.test_request_context("/test_modality_none"):
+            app.auth_service._token_authenticated(sender=None, token=None)
+
+            assert "X-Access-Modality" not in request.headers
 
 
 class TestProxyService:
