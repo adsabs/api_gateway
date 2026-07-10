@@ -114,7 +114,7 @@ class AuthService(GatewayService):
 
         @app.before_request
         def before_request_hook():
-            """Adds the X-api-uid and X-Access-Modality headers to the request if the user is authenticated with a session cookie."""
+            """Adds the X-api-uid header to the request if the user is authenticated with a session cookie."""
             headers = Headers(request.headers.items())
 
             # Stop clients from spoofing the identity/modality headers.
