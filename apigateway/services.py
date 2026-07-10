@@ -117,18 +117,12 @@ class AuthService(GatewayService):
             """Adds the X-api-uid and X-Access-Modality headers to the request if the user is authenticated with a session cookie."""
             headers = Headers(request.headers.items())
 
-            # Stop clients from spoofing modality header
+            # Stop clients from spoofing the identity/modality headers.
             headers.pop(AuthService.MODALITY_HEADER, None)
+            headers.pop("X-api-uid", None)
 
             if current_user.is_authenticated:
                 headers.add_header("X-api-uid", current_user.id)
-
-                if not current_user.is_anonymous_bootstrap_user:
-                    g.access_modality = "ui"
-                    headers[AuthService.MODALITY_HEADER] = "ui"
-
-            elif "X-api-uid" in request.headers:
-                headers.remove("X-api-uid")
 
             request.headers = headers
 
@@ -141,7 +135,14 @@ class AuthService(GatewayService):
 
         headers = Headers(request.headers.items())
         headers.add_header("X-api-uid", token.user.id)
-        headers[AuthService.MODALITY_HEADER] = g.get("access_modality") or "api"
+
+        # The only differentiator between API and UI clients is the client_name
+        client = token.client
+        client_name = client.client_name if client is not None else None
+        modality = "api" if client_name and "API" in client_name else "ui"
+
+        g.access_modality = modality
+        headers[AuthService.MODALITY_HEADER] = modality
 
         request.headers = headers
 
