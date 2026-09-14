@@ -264,6 +264,12 @@ class TestUserManagementView:
             _, status_code = user_management_view.post()
             assert status_code == 400
 
+    def test_post_new_user_disposable_email_from_ads_blocklist(self, app, user_management_view, new_user_data):
+        new_user_data["email"] = "test@blobapps.com"
+        with app.test_request_context(json=new_user_data):
+            _, status_code = user_management_view.post()
+            assert status_code == 400
+
     def test_post_existing_user(self, app, user_management_view, authenticated_user):
         existing_user = {
             "given_name": "Test",
