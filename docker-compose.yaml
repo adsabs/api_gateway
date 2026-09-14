@@ -8,13 +8,14 @@ services:
       ENABLE_OTEL: 'EXPORTER'
     volumes:
       - ./apigateway:/app/apigateway
+      - ./scripts:/app/scripts
     ports:
       - "5000:8181"
     depends_on:
       - db
       - redis
   db:
-    image: postgres:latest
+    image: postgres:17
     ports:
       - "5434:5432"
     environment:
