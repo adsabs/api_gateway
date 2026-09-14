@@ -8,6 +8,7 @@ services:
       ENABLE_OTEL: 'EXPORTER'
     volumes:
       - ./apigateway:/app/apigateway
+      - ./scripts:/app/scripts
     ports:
       - "5000:8181"
     depends_on:
