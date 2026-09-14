@@ -6,6 +6,8 @@ from typing import Tuple
 from urllib.parse import urljoin
 import re
 import os
+from disposable_email_domains import blocklist
+
 
 import jsondiff as jd
 import requests
@@ -372,3 +374,8 @@ def send_account_registration_attempt_email(email: str):
         ui_env=ui_env,
         ui_url=ui_url,
     )
+
+def generate_complete_blocklist():
+    with open(os.path.abspath(os.path.join(os.path.dirname(__file__), "disallowed_email_domain_list.conf"))) as f:
+        ads_list = f.readlines()
+    return set(ads_list + list(blocklist))

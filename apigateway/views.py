@@ -1,10 +1,10 @@
 import binascii
 import hashlib
 import json
+import os
 from copy import copy
 from datetime import datetime
 from urllib.parse import unquote
-from disposable_email_domains import blocklist
 
 import requests
 from authlib.integrations.flask_oauth2 import current_token
@@ -35,6 +35,7 @@ from apigateway.utils import (
     send_password_reset_email,
     send_welcome_email,
     verify_recaptcha,
+    generate_complete_blocklist
 )
 
 
@@ -206,6 +207,9 @@ class UserManagementView(Resource):
 
     decorators = [extensions.limiter_service.shared_limit("50/600 second")]
 
+    
+    complete_blocklist = generate_complete_blocklist()
+
     def post(self):
         params = schemas.user_register_request.load(get_json_body(request))
 
@@ -223,7 +227,7 @@ class UserManagementView(Resource):
         try:
             if current_app.config.get("BLOCK_DISPOSABLE_EMAIL_DOMAINS", False):
                 email_domain = params.email.split('@')[1]
-                if email_domain in blocklist:
+                if email_domain in self.complete_blocklist:
                     current_app.logger.warning("User {} attempting to register with disposable email domain.".format(params.email))
                     raise ValueError("Invalid email domain: {}. Account registration with disposable email services is not allowed.".format(email_domain))
             
