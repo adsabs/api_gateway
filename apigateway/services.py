@@ -83,6 +83,8 @@ class GatewayService:
 class AuthService(GatewayService):
     """A class that provides authentication services for the API Gateway."""
 
+    MODALITY_HEADER = "X-Access-Modality"
+
     def __init__(self, name: str = "AUTH_SERVICE"):
         """Initializes the AuthService.
 
@@ -104,7 +106,7 @@ class AuthService(GatewayService):
         self._register_hooks(app)
 
     def _register_hooks(self, app: Flask):
-        """Registers hooks that manipulates the headers of the request.
+        """Registers hooks that manipulate the headers of the request.
 
         Args:
             app (Flask): The Flask application to register the hooks with.
@@ -114,22 +116,35 @@ class AuthService(GatewayService):
         def before_request_hook():
             """Adds the X-api-uid header to the request if the user is authenticated with a session cookie."""
             headers = Headers(request.headers.items())
+
+            # Stop clients from spoofing the identity/modality headers.
+            headers.pop(AuthService.MODALITY_HEADER, None)
+            headers.pop("X-api-uid", None)
+
             if current_user.is_authenticated:
                 headers.add_header("X-api-uid", current_user.id)
-            elif "X-api-uid" in request.headers:
-                headers.remove("X-api-uid")
 
             request.headers = headers
 
-        def _token_authenticated(sender, token: OAuth2Token = None, **kwargs):
-            """Adds the X-api-uid header to the request if the user is authenticated with an auth token"""
+        token_authenticated.connect(self._token_authenticated, weak=False)
 
-            if token.user:
-                headers = Headers(request.headers.items())
-                headers.add_header("X-api-uid", token.user.id)
-                request.headers = headers
+    def _token_authenticated(self, sender, token: OAuth2Token = None, **kwargs):
+        """Adds the X-api-uid and X-Access-Modality headers for token-authenticated requests."""
+        if token is None or not token.user:
+            return
 
-        token_authenticated.connect(_token_authenticated, weak=False)
+        headers = Headers(request.headers.items())
+        headers.add_header("X-api-uid", token.user.id)
+
+        # The only differentiator between API and UI clients is the client_name
+        client = token.client
+        client_name = client.client_name if client is not None else None
+        modality = "api" if client_name and "API" in client_name else "ui"
+
+        g.access_modality = modality
+        headers[AuthService.MODALITY_HEADER] = modality
+
+        request.headers = headers
 
     def load_client(self, client_id: str) -> Tuple[OAuth2Client, OAuth2Token]:
         """Loads the OAuth2Client and OAuth2Token for the given client_id.
