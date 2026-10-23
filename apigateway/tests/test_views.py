@@ -1,3 +1,4 @@
+
 from datetime import datetime
 from unittest import mock
 from unittest.mock import MagicMock, patch
@@ -9,10 +10,16 @@ from marshmallow import ValidationError
 from werkzeug.exceptions import Unauthorized
 
 from apigateway import views
-from apigateway.email_templates import EmailChangedNotification, VerificationEmail
+from apigateway.email_templates import EmailChangedNotification
 from apigateway.models import AnonymousUser, EmailChangeRequest, User
 from apigateway.schemas import bootstrap_response
-from apigateway.utils import ProxyView
+from apigateway.domains import canonicalize_domain
+from apigateway.utils import (
+    DeliveryResult,
+    DeliveryState,
+    ProxyView,
+    generate_complete_blocklist,
+)
 
 
 class TestBootstrapView:
@@ -173,12 +180,16 @@ class TestProxyView:
         response = client.get("/proxy")
         assert response.data == b"504 Gateway Timeout"
         assert response.status_code == 504
+        assert response.content_type == "text/html; charset=utf-8"
+        assert response.content_length is not None
 
     def test_proxy_request_timeout(self, client, mock_session, mock_redis_service):
         mock_session.return_value.get.side_effect = requests.exceptions.Timeout
         response = client.get("/proxy")
         assert response.data == b"504 Gateway Timeout"
         assert response.status_code == 504
+        assert response.content_type == "text/html; charset=utf-8"
+        assert response.content_length is not None
 
     def test_allowed_headers(self, app, client, mock_session, mock_redis_service):
         response = client.get("/proxy")
@@ -227,6 +238,7 @@ class TestUserManagementView:
             "email": "testuser@gmail.com",
             "password1": "test_passwordU1",
             "password2": "test_passwordU1",
+            "g-recaptcha-response": "test-captcha",
         }
 
     @pytest.fixture
@@ -249,8 +261,9 @@ class TestUserManagementView:
 
     def test_post_new_user(self, app, user_management_view, new_user_data):
         with app.test_request_context(json=new_user_data):
-            _, status_code = user_management_view.post()
-            assert status_code == 200
+            response, status_code = user_management_view.post()
+            assert status_code == 202
+            assert response == {"message": views.ACCOUNT_ACCEPTED_MESSAGE}
 
     def test_post_new_user_invalid_data(self, app, user_management_view, new_user_data):
         new_user_data["email"] = "invalid_email"
@@ -258,17 +271,26 @@ class TestUserManagementView:
             with pytest.raises(ValidationError):
                 user_management_view.post()
 
-    def test_post_new_user_disposable_email(self, app, user_management_view, new_user_data):
-        new_user_data["email"] = "test@0-mail.com"
+    @pytest.mark.parametrize("domain", ["0-mail.com", "0-MAIL.COM"])
+    def test_post_new_user_disposable_email(
+        self, app, user_management_view, new_user_data, domain
+    ):
+        new_user_data["email"] = f"test@{domain}"
         with app.test_request_context(json=new_user_data):
             _, status_code = user_management_view.post()
             assert status_code == 400
 
-    def test_post_new_user_disposable_email_from_ads_blocklist(self, app, user_management_view, new_user_data):
-        new_user_data["email"] = "test@blobapps.com"
+    def test_post_new_user_disposable_email_from_local_blocklist(
+        self, app, user_management_view, new_user_data
+    ):
+        new_user_data["email"] = "test@BLOBAPPS.COM"
         with app.test_request_context(json=new_user_data):
             _, status_code = user_management_view.post()
             assert status_code == 400
+
+    def test_domain_policy_normalizes_curated_entries(self):
+        assert canonicalize_domain(" BlobApps.COM.\n") == "blobapps.com"
+        assert "blobapps.com" in generate_complete_blocklist()
 
     def test_post_existing_user(self, app, user_management_view, authenticated_user):
         existing_user = {
@@ -277,12 +299,13 @@ class TestUserManagementView:
             "password1": "test_passwordU1",
             "password2": "test_passwordU1",
             "email": authenticated_user.email,
+            "g-recaptcha-response": "test-captcha",
         }
 
         with app.test_request_context(json=existing_user):
             response, status_code = user_management_view.post()
-            assert status_code == 200
-            assert "error" not in response
+            assert status_code == 202
+            assert response == {"message": views.ACCOUNT_ACCEPTED_MESSAGE}
 
     def test_delete_user(self, app, user_management_view, authenticated_user):
         with app.test_request_context():
@@ -428,48 +451,59 @@ class TestChangeEmailView:
 
     @pytest.fixture
     def send_email_mock(self):
-        with mock.patch("apigateway.views.send_email") as _mock:
-            yield _mock
+        queued = DeliveryResult("email", DeliveryState.QUEUED, "queued")
+        with mock.patch(
+            "apigateway.views.enqueue_notification", return_value=queued
+        ) as action_mail, mock.patch(
+            "apigateway.views.enqueue_template_email", return_value=queued
+        ) as notice_mail:
+            yield action_mail, notice_mail
 
     def test_post_change_email(self, app, change_email_view, authenticated_user, send_email_mock):
         old_email = authenticated_user.email
+        action_mail, notice_mail = send_email_mock
         with app.test_request_context(
             json={"password": "Valid_password1", "email": "new_email@gmail.com"},
         ):
             login_user(authenticated_user)
             _, status_code = change_email_view.post()
-            assert status_code == 200
-            send_email_mock.assert_any_call(
-                app.config["MAIL_DEFAULT_SENDER"],
-                "new_email@gmail.com",
-                VerificationEmail,
-                verification_url=mock.ANY,
+            assert status_code == 202
+            assert action_mail.call_args.args[0] == "email_change_verification"
+            assert action_mail.call_args.args[1]["action_id"] > 0
+            assert action_mail.call_args.args[1]["ui_env"] == "ADS"
+            assert action_mail.call_args.kwargs["commit"] is False
+            notice_mail.assert_called_once_with(
+                old_email,
+                EmailChangedNotification,
                 ui_env="ADS",
                 ui_url="https://ui.adsabs.harvard.edu",
-            )
-            send_email_mock.assert_any_call(
-                app.config["MAIL_DEFAULT_SENDER"], old_email, EmailChangedNotification, ui_env=mock.ANY, ui_url=mock.ANY,
+                dedupe_key=f"change-email-notify:{authenticated_user.id}",
+                session=mock.ANY,
+                commit=False,
+                replace=True,
             )
 
     def test_post_change_email_scix(self, app, change_email_view, authenticated_user, send_email_mock):
         old_email = authenticated_user.email
+        action_mail, notice_mail = send_email_mock
         with app.test_request_context(
             json={"password": "Valid_password1", "email": "new_email@gmail.com"},
-            headers={"Host":"https://scixplorer.org"}
+            headers={"Host": "scixplorer.org"},
         ):
             login_user(authenticated_user)
             _, status_code = change_email_view.post()
-            assert status_code == 200
-            send_email_mock.assert_any_call(
-                app.config["MAIL_DEFAULT_SENDER"],
-                "new_email@gmail.com",
-                VerificationEmail,
-                verification_url=mock.ANY,
+            assert status_code == 202
+            assert action_mail.call_args.args[1]["ui_env"] == "SciX"
+            assert action_mail.call_args.args[1]["ui_url"] == "https://scixplorer.org"
+            notice_mail.assert_called_once_with(
+                old_email,
+                EmailChangedNotification,
                 ui_env="SciX",
                 ui_url="https://scixplorer.org",
-            )
-            send_email_mock.assert_any_call(
-                app.config["MAIL_DEFAULT_SENDER"], old_email, EmailChangedNotification, ui_env=mock.ANY, ui_url=mock.ANY,
+                dedupe_key=f"change-email-notify:{authenticated_user.id}",
+                session=mock.ANY,
+                commit=False,
+                replace=True,
             )
 
     def test_post_change_email_incorrect_password(
