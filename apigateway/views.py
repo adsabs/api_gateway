@@ -35,7 +35,8 @@ from apigateway.utils import (
     send_password_reset_email,
     send_welcome_email,
     verify_recaptcha,
-    generate_complete_blocklist
+    generate_complete_blocklist,
+    normalize_email_domain,
 )
 
 
@@ -226,11 +227,11 @@ class UserManagementView(Resource):
 
         try:
             if current_app.config.get("BLOCK_DISPOSABLE_EMAIL_DOMAINS", False):
-                email_domain = params.email.split('@')[1]
+                email_domain = normalize_email_domain(params.email.rsplit("@", 1)[1])
                 if email_domain in self.complete_blocklist:
                     current_app.logger.warning("User {} attempting to register with disposable email domain.".format(params.email))
                     raise ValueError("Invalid email domain: {}. Account registration with disposable email services is not allowed.".format(email_domain))
-            
+
             user: User = extensions.security_service.create_user(
                 given_name=params.given_name,
                 family_name=params.family_name,
@@ -480,28 +481,17 @@ class VerifyEmailView(Resource):
 
 
 class ChacheManagementView(Resource):
-    """A view for managing the cache.
+    """Invalidate every cached representation for a route.
 
-    This class provides an API endpoint for clearing the cache based on the provided key and parameters.
-
-
-    Examples:
-
-    Clearing the cache for a specific resource and parameters:
-
-    DELETE
-    {
-        "key": "/scan/metadata/article/extra/123",
-        "parameters": {"test": "123"}
-    }
-
+    DELETE with ``{"key": "/scan/metadata/article/123"}`` bumps the
+    route generation. ``{"key": "*"}`` clears the complete proxy cache.
     """
 
     decorators = [extensions.auth_service.require_oauth("adsws:internal")]
 
     def delete(self):
         params = schemas.clear_cache_request.load(get_json_body(request))
-        extensions.cache_service.clear_cache(params.key, params.parameters)
+        extensions.cache_service.clear_cache(params.key)
         return {"message": "success"}, 200
 
 
