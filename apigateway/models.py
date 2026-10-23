@@ -1,3 +1,6 @@
+import uuid
+
+from datetime import datetime
 from typing import List
 
 import sqlalchemy as sa
@@ -105,7 +108,9 @@ class OAuth2Client(base_model, OAuth2ClientMixin):
 
     id = sa.Column(sa.Integer, primary_key=True, autoincrement=True)
     user_id = sa.Column(
-        sa.String, sa.ForeignKey("user.fs_uniquifier", ondelete="CASCADE"), index=True
+        sa.String,
+        sa.ForeignKey("user.fs_uniquifier", ondelete="CASCADE"),
+        index=True,
     )
     ratelimit_multiplier = sa.Column(sa.Float, default=1.0)
     individual_ratelimit_multipliers = sa.Column(sa.JSON)
@@ -129,7 +134,9 @@ class OAuth2Token(base_model, OAuth2TokenMixin):
 
     id = sa.Column(sa.Integer, primary_key=True, autoincrement=True)
     user_id = sa.Column(
-        sa.String, sa.ForeignKey("user.fs_uniquifier", ondelete="CASCADE"), index=True
+        sa.String,
+        sa.ForeignKey("user.fs_uniquifier", ondelete="CASCADE"),
+        index=True,
     )
     user = relationship("User")
     client_id = sa.Column(
@@ -147,20 +154,53 @@ class OAuth2Token(base_model, OAuth2TokenMixin):
         return self.issued_at + self.expires_in
 
 
-class EmailChangeRequest(base_model):
-    __tablename__ = "email_change_request"
+
+class AccountActionToken(base_model):
+    __tablename__ = "account_action_token"
+    __table_args__ = (
+        sa.CheckConstraint(
+            "purpose IN ('password_reset', 'verify_registration', 'change_email')",
+            name="ck_account_action_token_purpose",
+        ),
+        sa.UniqueConstraint(
+            "user_id", "purpose", name="uq_account_action_token_user_purpose"
+        ),
+    )
 
     id = sa.Column(sa.Integer, primary_key=True, autoincrement=True)
-    token = sa.Column(sa.String(255), unique=True)
-    user_id = sa.Column(sa.Integer(), sa.ForeignKey("user.id", ondelete="CASCADE"))
+    delivery_id = sa.Column(
+        sa.String(36), unique=True, nullable=False, default=lambda: str(uuid.uuid4())
+    )
+    token_digest = sa.Column(sa.String(64), nullable=False, unique=True, index=True)
+    user_id = sa.Column(
+        sa.Integer,
+        sa.ForeignKey("user.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    purpose = sa.Column(sa.String(32), nullable=False)
+    target_email = sa.Column(sa.String(255), nullable=False)
+    state_digest = sa.Column(sa.String(64), nullable=False)
+    issued_at = sa.Column(sa.DateTime(timezone=True), nullable=False)
+    expires_at = sa.Column(sa.DateTime(timezone=True), nullable=False)
     user = relationship("User")
-    new_email = sa.Column(sa.Text)
 
 
-class PasswordChangeRequest(base_model):
-    __tablename__ = "password_change_request"
+class NotificationOutbox(base_model):
+    __tablename__ = "notification_outbox"
 
     id = sa.Column(sa.Integer, primary_key=True, autoincrement=True)
-    token = sa.Column(sa.String(255), unique=True)
-    user_id = sa.Column(sa.Integer(), sa.ForeignKey("user.id", ondelete="CASCADE"))
-    user = relationship("User")
+    event_type = sa.Column(sa.String(64), nullable=False)
+    payload = sa.Column(sa.JSON, nullable=False)
+    payload_size = sa.Column(sa.Integer, nullable=False, default=0)
+    state = sa.Column(sa.String(24), nullable=False, default="pending", index=True)
+    attempts = sa.Column(sa.Integer, nullable=False, default=0)
+    available_at = sa.Column(sa.DateTime, nullable=False, default=datetime.utcnow, index=True)
+    claimed_at = sa.Column(sa.DateTime)
+    ownership_token = sa.Column(sa.String(36), index=True)
+    dedupe_key = sa.Column(sa.String(320), unique=True)
+    last_error = sa.Column(sa.String(64))
+    terminal_at = sa.Column(sa.DateTime, index=True)
+    created_at = sa.Column(sa.DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = sa.Column(
+        sa.DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow
+    )
