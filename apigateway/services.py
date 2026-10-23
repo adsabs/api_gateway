@@ -15,7 +15,6 @@ from urllib.parse import urljoin
 import requests
 from authlib.integrations.flask_oauth2 import current_token, token_authenticated
 from authlib.integrations.sqla_oauth2 import create_bearer_token_validator
-from cachelib.serializers import RedisSerializer
 from flask import Flask, current_app, g, request
 from flask.wrappers import Response
 from flask_caching import Cache
@@ -34,7 +33,14 @@ from werkzeug.security import gen_salt
 
 from apigateway import extensions
 from apigateway.exceptions import NoClientError, NotFoundError, ValidationError
+from apigateway.logging_utils import exception_log_fields
 from apigateway.models import AnonymousUser, OAuth2Client, OAuth2Token, Role, User
+from apigateway.redis_serialization import (
+    RedisJsonCodec,
+    RedisSerializationError,
+    dumps_storage_value,
+    loads_storage_value,
+)
 from apigateway.utils import GatewayResourceProtector, ProxyView
 
 
@@ -236,7 +242,7 @@ class AuthService(GatewayService):
             token = self._create_user_token(client, expires=expires)
             extensions.db.session.add(token)
 
-            self._logger.info("Created BB client for {email}".format(email=current_user.email))
+            self._logger.info("Created OAuth client")
         else:
             token = OAuth2Token.query.filter_by(
                 client_id=client.id,
@@ -247,7 +253,7 @@ class AuthService(GatewayService):
                 token = self._create_user_token(client, expires=expires)
 
                 extensions.db.session.add(token)
-                self._logger.info("Created BB client for {email}".format(email=current_user.email))
+                self._logger.info("Created OAuth client")
 
             client.last_activity = datetime.now()
             extensions.db.session.add(client)
@@ -435,17 +441,19 @@ class ProxyService(GatewayService):
             deploy_path (str): The deployment path of the service
             csrf_exempt (bool, optional): Whether to exempt the services from CSRF protection. Defaults to True.
         """
-        self._logger.info("Registering service %s at %s", base_url, deploy_path)
+        self._logger.info("Registering proxy service")
 
         try:
             resource_json = self._fetch_resource_document(base_url)
-        except requests.exceptions.RequestException as ex:
-            self._logger.error("Could not fetch resource document for %s: %s", base_url, ex)
+        except requests.exceptions.RequestException as exception:
+            self._logger.error(
+                "Proxy service discovery failed exception=%s",
+                type(exception).__name__,
+            )
             return
 
-        self._logger.info("Discovered %s endpoints:", deploy_path)
+        self._logger.info("Discovered proxy service endpoints count=%s", len(resource_json))
         for remote_path, properties in resource_json.items():
-            self._logger.info("- %s", remote_path)
 
             properties.setdefault(
                 "rate_limit",
@@ -522,7 +530,7 @@ class ProxyService(GatewayService):
             return response.json()
         except requests.exceptions.RequestException as ex:
             if extensions.storage_service.has(resource_url):
-                self._logger.info("Using cached resource document for %s", resource_url)
+                self._logger.info("Using cached proxy resource document")
                 return extensions.storage_service.get(resource_url)
             else:
                 raise ex
@@ -671,7 +679,7 @@ class LimiterService(GatewayService, Limiter):
             all_limits = list(defaults) + list(decorated)
             for limit in all_limits:
                 key = limit.limit.key_for(request_endpoint, scope)
-                self._logger.info("Clearing limit for key %s", key)
+                self._logger.info("Clearing rate limit entry")
                 self.storage.clear(key)
 
             extensions.storage_service.delete(
@@ -912,6 +920,8 @@ class StorageService(GatewayService):
     It supports both Redis storage and fallbacks to memory storage in case Redis is down.
     """
 
+    KEY_PREFIX = "gateway:storage:v1:"
+
     def __init__(self, name: str = "STORAGE_SERVICE"):
         super().__init__(name)
         self._fallback_storage: dict = {}
@@ -920,21 +930,22 @@ class StorageService(GatewayService):
         super().init_app(app)
         self._redis_service = redis_service
         self._redis_down = False
-        self._serializer = RedisSerializer()
+        self._serializer = RedisJsonCodec()
+        self._key_prefix = self.get_service_config("KEY_PREFIX", self.KEY_PREFIX)
 
-    def _serialize(self, value: any) -> str | bytes:
-        """Serializes the given value.
+    def _storage_key(self, key: str) -> str:
+        return self._key_prefix + key
 
-        Args:
-            value (any): The value to serialize.
+    def _serialize(self, value: any) -> bytes:
+        """Serialize values without interfering with Redis numeric operations."""
+        return dumps_storage_value(self._serializer, value)
 
-        Returns:
-            str | bytes: The serialized value.
-        """
-        if isinstance(value, (int, float, str)):
-            return str(value)
-        else:
-            return self._serializer.dumps(value)
+    def _deserialize(self, key: str, value: bytes):
+        try:
+            return True, loads_storage_value(self._serializer, value)
+        except RedisSerializationError:
+            self._redis_service.delete(key)
+            return False, None
 
     def _transfer_to_redis(self):
         """
@@ -944,8 +955,6 @@ class StorageService(GatewayService):
         After the transfer is complete, the fallback storage is cleared.
         """
         for key, value in self._fallback_storage.items():
-            if isinstance(value, dict):
-                value = json.dumps(value)
             self._redis_service.set(key, self._serialize(value))
         self._fallback_storage.clear()
 
@@ -962,74 +971,93 @@ class StorageService(GatewayService):
                 self._redis_down = True
                 self._logger.warning("Redis is down, falling back to local storage")
                 return func(self, *args, **kwargs)
-            except Exception as ex:
-                self._logger.error("Failed to handle Redis exception", ex)
+            except Exception as exception:
+                self._logger.error(
+                    "Redis operation failed exception=%s",
+                    type(exception).__name__,
+                )
                 raise
 
         return wrapper
 
     @handle_redis_exception
     def set(self, key: str, value: str, timeout: int = None) -> bool:
+        storage_key = self._storage_key(key)
         if not self._redis_down:
             value = self._serialize(value)
 
             if timeout is None:
-                return bool(self._redis_service.set(key, value))
+                return bool(self._redis_service.set(storage_key, value))
             else:
-                return bool(self._redis_service.setex(key, timeout, value))
+                return bool(self._redis_service.setex(storage_key, timeout, value))
         else:
-            self._fallback_storage[key] = value
+            self._fallback_storage[storage_key] = value
             return True
 
     @handle_redis_exception
     def get(self, key: str) -> str:
+        storage_key = self._storage_key(key)
         if not self._redis_down:
-            value = self._redis_service.get(key)
-
-            if value is not None:
-                value = self._serializer.loads(value)
-
+            value = self._redis_service.get(storage_key)
+            if value is None:
+                return None
+            _, value = self._deserialize(storage_key, value)
             return value
         else:
-            return self._fallback_storage.get(key)
+            return self._fallback_storage.get(storage_key)
 
     @handle_redis_exception
     def delete(self, key: str) -> bool:
+        storage_key = self._storage_key(key)
         if not self._redis_down:
-            return bool(self._redis_service.delete(key))
+            return bool(self._redis_service.delete(storage_key))
         else:
-            return bool(self._fallback_storage.pop(key, None))
+            return bool(self._fallback_storage.pop(storage_key, None))
 
     @handle_redis_exception
     def incr(self, key: str) -> int:
+        storage_key = self._storage_key(key)
         if not self._redis_down:
-            return self._redis_service.incr(key)
+            return self._redis_service.incr(storage_key)
         else:
-            self._fallback_storage[key] = self._fallback_storage.get(key, 0) + 1
-            return self._fallback_storage[key]
+            self._fallback_storage[storage_key] = (
+                self._fallback_storage.get(storage_key, 0) + 1
+            )
+            return self._fallback_storage[storage_key]
 
     @handle_redis_exception
     def incrby(self, key: str, increment: int) -> int:
+        storage_key = self._storage_key(key)
         if not self._redis_down:
-            return self._redis_service.incrby(key, increment)
+            return self._redis_service.incrby(storage_key, increment)
         else:
-            self._fallback_storage[key] = self._fallback_storage.get(key, 0) + increment
-            return self._fallback_storage[key]
+            self._fallback_storage[storage_key] = (
+                self._fallback_storage.get(storage_key, 0) + increment
+            )
+            return self._fallback_storage[storage_key]
 
     @handle_redis_exception
     def incrbyfloat(self, key: str, increment: float) -> float:
+        storage_key = self._storage_key(key)
         if not self._redis_down:
-            return self._redis_service.incrbyfloat(key, increment)
+            return self._redis_service.incrbyfloat(storage_key, increment)
         else:
-            self._fallback_storage[key] = self._fallback_storage.get(key, 0.0) + increment
-            return self._fallback_storage[key]
+            self._fallback_storage[storage_key] = (
+                self._fallback_storage.get(storage_key, 0.0) + increment
+            )
+            return self._fallback_storage[storage_key]
 
     @handle_redis_exception
     def has(self, key: str) -> bool:
+        storage_key = self._storage_key(key)
         if not self._redis_down:
-            return bool(self._redis_service.exists(key))
+            value = self._redis_service.get(storage_key)
+            if value is None:
+                return False
+            valid, _ = self._deserialize(storage_key, value)
+            return valid
         else:
-            return key in self._fallback_storage
+            return storage_key in self._fallback_storage
 
 
 class CacheService(GatewayService, Cache):
@@ -1043,9 +1071,18 @@ class CacheService(GatewayService, Cache):
         GatewayService.init_app(self, app)
 
         app.config.setdefault("CACHE_REDIS_URL", self.get_service_config("REDIS_URI"))
-        app.config.setdefault("CACHE_TYPE", self.get_service_config("CACHE_TYPE", "RedisCache"))
+        app.config.setdefault(
+            "CACHE_KEY_PREFIX", self.get_service_config("KEY_PREFIX", "gateway:cache:v1:")
+        )
+        app.config.setdefault(
+            "CACHE_TYPE",
+            self.get_service_config(
+                "CACHE_TYPE", "apigateway.redis_serialization.SafeRedisCache"
+            ),
+        )
 
         Cache.init_app(self, app)
+        app.extensions["cache"][self].serializer = RedisJsonCodec()
 
     def clear_cache(self, request_path: str, parameters: dict) -> bool:
         """Clears the cache for the specified request path and parameters.
@@ -1063,7 +1100,7 @@ class CacheService(GatewayService, Cache):
 
         params_tuple = list(parameters.items()) if parameters else []
         key = self._make_cache_key(request_path, params_tuple)
-        self._logger.info("Clearing cache for key %s", key)
+        self._logger.info("Clearing cache entry")
         return self.delete(key)
 
     def cached(
@@ -1326,7 +1363,7 @@ class SecurityService(GatewayService, Security):
 
         if user_id is None:
             user_id = current_user.id
-        current_app.logger.info("Generating password token for user: {}".format(user_id))
+        current_app.logger.info("Generating password token")
 
         return self.generate_token(user_id, salt=self.get_service_config("VERIFY_PASSWORD_SALT"))
 
@@ -1382,12 +1419,13 @@ class SecurityService(GatewayService, Security):
         """
         try:
             user_id = self._token_serializer.loads(token, max_age=86400, salt=salt)
-        except Exception as ex:
+        except Exception as exception:
             self._logger.warning(
-                "{0} verification token not validated. Reason: {1}".format(token, ex)
+                "Verification token rejected method=%s route=%s exception=%s",
+                *exception_log_fields(exception),
             )
             raise ValueError("unknown verification token")
-        current_app.logger.info("Verifying token for user: {}".format(user_id))
+        current_app.logger.info("Verification token accepted")
         user: User = User.query.filter_by(id=user_id).first()
 
         if user is None:
@@ -1415,8 +1453,11 @@ class KafkaProducerService(GatewayService):
                 request_timeout_ms=self.get_service_config("REQUEST_TIMEOUT_MS", 500),
                 acks=0,  # Fire and forget. We don't want issues with the broker to affect the Gateway.
             )
-        except Exception as ex:
-            self._logger.error("Could not connect to Kafka: %s", ex)
+        except Exception as exception:
+            self._logger.error(
+                "Kafka connection failed exception=%s",
+                type(exception).__name__,
+            )
             return None
 
     def _register_hooks(self, app: Flask):
@@ -1425,8 +1466,11 @@ class KafkaProducerService(GatewayService):
             if self._producer is not None:
                 try:
                     real_user = current_user._get_current_object()
-                except RuntimeError:
-                    current_app.logger.exception("Unable to collect real user. Most likely due to unbound session.")
+                except RuntimeError as exception:
+                    current_app.logger.error(
+                        "Kafka user collection failed exception=%s",
+                        type(exception).__name__,
+                    )
                     return response
                 self._producer.send(
                     self.get_service_config("REQUEST_TOPIC"),
