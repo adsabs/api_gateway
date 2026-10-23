@@ -12,9 +12,12 @@ def app(request):
     app = create_app(
         **{
             "SQLALCHEMY_DATABASE_URI": "sqlite:///:memory:",
+            "REDIS_SERVICE_URL": "redis://localhost:6379/0",
+            "LIMITER_SERVICE_STORAGE_URI": "redis://localhost:6379/0",
+            "CACHE_SERVICE_REDIS_URI": "redis://localhost:6379/1",
             "SQLALCHEMY_ECHO": False,
             "TESTING": True,
-            "DEBUG": True,
+            "DEBUG": False,
             "PROPAGATE_EXCEPTIONS": True,
             "TRAP_BAD_REQUEST_ERRORS": True,
             "PRESERVE_CONTEXT_ON_EXCEPTION": False,
@@ -22,7 +25,31 @@ def app(request):
             "BOOTSTRAP_TOKEN_EXPIRES": 3600,
             "PROXY_SERVICE_ALLOWED_HEADERS": ["test_allowed_header"],
             "LIMITER_SERVICE_SCALING_COST_ENABLED": False,
+            "SECRET_KEY": "flask-test-signing-key-32-bytes-minimum",
+            "SECRET_KEY_ENCODING": "utf-8",
+            "SECURITY_SERVICE_SECRET_KEY": "serializer-test-key-32-bytes-minimum",
+            "SECURITY_SERVICE_VERIFY_PASSWORD_SALT": (
+                "password-test-purpose-salt-32-bytes-minimum"
+            ),
+            "SECURITY_SERVICE_VERIFY_EMAIL_SALT": (
+                "email-test-purpose-salt-32-bytes-minimum"
+            ),
+            "GOOGLE_RECAPTCHA_PRIVATE_KEY": "explicit-test-recaptcha-key",
+            "RECAPTCHA_TEST_BYPASS": True,
+            "MAIL_TEST_BYPASS": True,
+            "TRUSTED_HOSTS": ["localhost", "scixplorer.org"],
+            "SITE_HOST_MAPPING": {
+                "localhost": "ADS",
+                "scixplorer.org": "SCIX",
+            },
+            "CORS_DOMAINS": [
+                "https://ui.adsabs.harvard.edu",
+                "https://scixplorer.org",
+            ],
+            "HTTPS_ENFORCEMENT": False,
+            "TRUSTED_PROXY_HOPS": 0,
         },
+        allow_insecure_test_config=True,
         name=request.node.name,
     )
 

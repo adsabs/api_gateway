@@ -5,6 +5,7 @@ from logging.config import fileConfig
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 
+from apigateway.config import load_migration_database_url
 from apigateway.models import base_model
 
 project_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -56,20 +57,6 @@ def run_migrations_offline() -> None:
         context.run_migrations()
 
 
-def get_app_config(key):
-    opath = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    if opath not in sys.path:
-        sys.path.insert(0, opath)
-
-    from apigateway import app as application
-
-    app = application.create_app()
-
-    with app.app_context() as c:
-        print("Getting actual config for", key, app.config.get(key))
-        return app.config.get(key)
-
-
 def run_migrations_online() -> None:
     """Run migrations in 'online' mode.
 
@@ -79,7 +66,7 @@ def run_migrations_online() -> None:
     """
     cfg = config.get_section(config.config_ini_section)
     if "use_flask_db_url" in cfg and cfg["use_flask_db_url"] == "true":
-        cfg["sqlalchemy.url"] = get_app_config("SQLALCHEMY_DATABASE_URI")
+        cfg["sqlalchemy.url"] = load_migration_database_url()
 
     engine = engine_from_config(cfg, prefix="sqlalchemy.", poolclass=pool.NullPool)
 

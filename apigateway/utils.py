@@ -13,11 +13,12 @@ import jsondiff as jd
 import requests
 from authlib.oauth2.rfc6749.errors import UnsupportedTokenTypeError
 from authlib.integrations.flask_oauth2 import ResourceProtector
-from flask import Request, current_app, request
+from flask import Request, abort, current_app, request
 from flask.views import View
 from flask_login import current_user
 
 from apigateway import extensions
+from apigateway.config import canonical_authority
 from apigateway.email_templates import (
     AccountRegistrationAttemptEmail,
     EmailTemplate,
@@ -25,6 +26,37 @@ from apigateway.email_templates import (
     WelcomeVerificationEmail,
 )
 from apigateway.exceptions import Oauth2HttpError
+from apigateway.logging_utils import exception_log_fields, request_log_fields
+
+
+def get_request_site():
+    """Return the site assigned to the request's exact trusted authority."""
+    host_headers = request.headers.getlist("Host")
+    if len(host_headers) != 1:
+        abort(400)
+    try:
+        authority = canonical_authority(host_headers[0])
+    except ValueError:
+        abort(400)
+    try:
+        return current_app.config["SITE_HOST_MAPPING"][authority]
+    except KeyError:
+        abort(400)
+
+
+def get_request_site_settings():
+    """Return the UI name, URL, and verification URL for this request."""
+    if get_request_site() == "SCIX":
+        return (
+            "SciX",
+            current_app.config["SCIX_HOST_DOMAIN"],
+            current_app.config["SCIX_VERIFY_URL"],
+        )
+    return (
+        "ADS",
+        current_app.config["ADS_HOST_DOMAIN"],
+        current_app.config["VERIFY_URL"],
+    )
 
 
 def require_non_anonymous_bootstrap_user(func):
@@ -47,22 +79,10 @@ def send_email(
     ui_env: str = "ADS",
     ui_url: str = "https://ui.adsabs.harvard.edu",
 ):
-    current_app.logger.info("From send_email: Host header: {}".format(request.headers.get("Host", "No Host Specified")))
-
-    # Do not send emails if in debug mode
-    if current_app.config.get("TESTING", False):
+    if current_app.config["MAIL_TEST_BYPASS"]:
         current_app.logger.warning(
-            "Email was NOT sent to '{}' with verification URL '{}' due to TESTING flag = True".format(
-                recipient, verification_url
-            )
-        )
-        return
-
-    if request.headers.get("Host", "").endswith("shadow"):
-        current_app.logger.info(
-            "Email was NOT sent to '{}' with verification URL '{}' due to Host ending with shadow".format(
-                recipient, verification_url
-            )
+            "Email delivery suppressed outcome=testing method=%s route=%s",
+            *request_log_fields(),
         )
         return
 
@@ -91,14 +111,10 @@ def send_feedback_email(
     attachments: list = None,
     mail_server: str = None,
 ):
-    # Do not send emails if in debug mode
-    current_app.logger.info("From send_feedback_email: Host header: {}".format(request.headers.get("Host", "No Host Specified")))
-
-    if current_app.config.get("TESTING", False) or request.headers.get("Host", "").endswith("shadow"):
+    if current_app.config["MAIL_TEST_BYPASS"]:
         current_app.logger.warning(
-            "Feedback email with subject {} was NOT sent due to TESTING flag = True".format(
-                subject
-            )
+            "Feedback email delivery suppressed method=%s route=%s",
+            *request_log_fields(),
         )
         return
 
@@ -127,8 +143,11 @@ def send_feedback_email(
     with smtplib.SMTP(mail_server) as s:
         try:
             s.send_message(message)
-        except Exception:
-            current_app.logger.exception("Failed to send message for Feedback email from: {}".format(submitter_email))
+        except Exception as exception:
+            current_app.logger.error(
+                "Feedback email delivery failed method=%s route=%s exception=%s",
+                *exception_log_fields(exception),
+            )
 
 
 def verify_recaptcha(request: Request, endpoint: str = None):
@@ -143,10 +162,11 @@ def verify_recaptcha(request: Request, endpoint: str = None):
     Returns:
         bool: True if reCAPTCHA verification is successful, False otherwise.
     """
-    current_app.logger.info("From verify recaptcha: Host header: {}".format(request.headers.get("Host", "No Host Specified")))
-    # Skip reCAPTCHA verification if in debug mode
-    if current_app.config.get("TESTING", False) or request.headers.get("Host", "").endswith("shadow"):
-        current_app.logger.warning("reCAPTCHA is NOT verified during testing")
+    if current_app.config["RECAPTCHA_TEST_BYPASS"]:
+        current_app.logger.warning(
+            "reCAPTCHA verification suppressed method=%s route=%s",
+            *request_log_fields(),
+        )
         return True
 
     endpoint = endpoint or current_app.config["GOOGLE_RECAPTCHA_ENDPOINT"]
@@ -237,7 +257,8 @@ class ProxyView(View):
             http_method_func = getattr(self._session, request.method.lower())
 
             current_app.logger.info(
-                "Proxying %s request to %s", request.method.upper(), remote_url
+                "Proxy request started method=%s route=%s",
+                *request_log_fields(),
             )
 
             response: requests.Response = http_method_func(
@@ -245,9 +266,10 @@ class ProxyView(View):
             )
 
             return response.content, response.status_code, dict(response.headers)
-        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exception:
             current_app.logger.info(
-                "Gateway Timeout with %s request to %s", request.method.upper(), remote_url
+                "Proxy request failed outcome=gateway_timeout method=%s route=%s exception=%s",
+                *exception_log_fields(exception),
             )
             return b"504 Gateway Timeout", 504
 
@@ -270,8 +292,11 @@ class ProxyView(View):
                 resolver_groups = resolver_check.groups()
                 return str(self._remote_base_url) + "/" + os.path.normpath(resolver_groups[0]) \
                     + resolver_groups[1] + os.path.normpath(resolver_groups[2])
-        except ValueError:
-            current_app.logger.exception("Failed to properly check url path for resolver verify_url path.")    
+        except ValueError as exception:
+            current_app.logger.error(
+                "Proxy URL construction failed method=%s route=%s exception=%s",
+                *exception_log_fields(exception),
+            )
         return urljoin(self._remote_base_url, path)
 
 
@@ -323,14 +348,8 @@ def make_json_diff(original: str, updated: str):
 
 
 def send_password_reset_email(token: str, email: str):
-    if "scixplorer" in request.headers.get("Host", ""):
-        ui_env = "SciX"
-        ui_url = current_app.config.get("SCIX_HOST_DOMAIN", "dev.scixplorer.org")
-        verification_url = f"{current_app.config['SCIX_VERIFY_URL']}/reset-password/{token}"
-    else:
-        ui_env = "ADS"
-        ui_url = current_app.config.get("ADS_HOST_DOMAIN", "dev.adsabs.harvard.edu")
-        verification_url = f"{current_app.config['VERIFY_URL']}/reset-password/{token}"    
+    ui_env, ui_url, verify_url = get_request_site_settings()
+    verification_url = f"{verify_url}/reset-password/{token}"
     send_email(
         sender=current_app.config["MAIL_DEFAULT_SENDER"],
         recipient=email,
@@ -342,14 +361,8 @@ def send_password_reset_email(token: str, email: str):
 
 
 def send_welcome_email(token: str, email: str):
-    if "scixplorer" in request.headers.get("Host", ""):
-        ui_env = "SciX"
-        ui_url = current_app.config.get("SCIX_HOST_DOMAIN", "dev.scixplorer.org")
-        verification_url = f"{current_app.config['SCIX_VERIFY_URL']}/register/{token}"
-    else:
-        ui_env = "ADS"
-        ui_url = current_app.config.get("ADS_HOST_DOMAIN", "dev.adsabs.harvard.edu")
-        verification_url = f"{current_app.config['VERIFY_URL']}/register/{token}"
+    ui_env, ui_url, verify_url = get_request_site_settings()
+    verification_url = f"{verify_url}/register/{token}"
     send_email(
         sender=current_app.config["MAIL_DEFAULT_SENDER"],
         recipient=email,
@@ -361,12 +374,7 @@ def send_welcome_email(token: str, email: str):
 
 
 def send_account_registration_attempt_email(email: str):
-    if "scixplorer" in request.headers.get("Host", ""):
-            ui_env = "SciX"
-            ui_url = current_app.config.get("SCIX_HOST_DOMAIN", "dev.scixplorer.org")
-    else:
-        ui_env = "ADS"
-        ui_url = current_app.config.get("ADS_HOST_DOMAIN", "dev.adsabs.harvard.edu")
+    ui_env, ui_url, _ = get_request_site_settings()
     send_email(
         sender=current_app.config["MAIL_DEFAULT_SENDER"],
         recipient=email,
@@ -375,7 +383,20 @@ def send_account_registration_attempt_email(email: str):
         ui_url=ui_url,
     )
 
+def normalize_email_domain(domain: str) -> str:
+    """Return the canonical form used for disposable-domain policy checks."""
+    return domain.strip().rstrip(".").lower()
+
+
 def generate_complete_blocklist():
-    with open(os.path.abspath(os.path.join(os.path.dirname(__file__), "disallowed_email_domain_list.conf"))) as f:
-        ads_list = f.readlines()
-    return set(ads_list + list(blocklist))
+    local_blocklist_path = os.path.join(
+        os.path.dirname(__file__), "disallowed_email_domain_list.conf"
+    )
+    with open(local_blocklist_path, encoding="utf-8") as domain_file:
+        domains = list(domain_file) + list(blocklist)
+
+    return {
+        normalized
+        for domain in domains
+        if (normalized := normalize_email_domain(domain))
+    }
