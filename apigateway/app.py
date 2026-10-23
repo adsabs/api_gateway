@@ -1,13 +1,18 @@
+from pathlib import Path
+
 from adsmutils import ADSFlask
 from authlib.integrations.flask_oauth2 import current_token
 from authlib.integrations.sqla_oauth2 import (
     create_query_client_func,
     create_save_token_func,
 )
-from flask import Flask, abort, jsonify, request, session, current_app
+from flask import Flask, abort, current_app, jsonify, request, session
 from flask_restful import Api
 from marshmallow import ValidationError as MarshmallowValidationError
+from werkzeug.exceptions import RequestEntityTooLarge
+from werkzeug.middleware.proxy_fix import ProxyFix
 
+from apigateway import config as gateway_config
 from apigateway import exceptions, extensions, views
 from apigateway.models import OAuth2Client, OAuth2Token, User
 
@@ -25,6 +30,39 @@ from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader, Cons
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
 
+_APP_NAME = __name__
+_PROJECT_ROOT = Path(__file__).resolve().parent
+
+
+def _request_too_large_response():
+    response = jsonify({"message": "Request body too large"})
+    response.status_code = 413
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+class GatewayApi(Api):
+    def handle_error(self, error):
+        if isinstance(error, RequestEntityTooLarge):
+            return _request_too_large_response()
+        return super().handle_error(error)
+
+SENSITIVE_ACCOUNT_ENDPOINTS = frozenset(
+    {
+        "account_bootstrap",
+        "account_csrf",
+        "account_login",
+        "account_personal_token",
+        "account_change_password",
+        "account_change_email",
+        "account_verify",
+        "account_verification_resend",
+        "account_reset_password",
+        "account_reset_password_verify",
+    }
+)
+
+
 def register_extensions(app: Flask):
     """Register extensions.
 
@@ -33,6 +71,7 @@ def register_extensions(app: Flask):
     """
 
     extensions.db.init_app(app)
+    app.db = extensions.db
     extensions.ma.init_app(app)
 
     extensions.cors.init_app(
@@ -59,8 +98,30 @@ def register_extensions(app: Flask):
     extensions.cache_service.init_app(app)
     extensions.kakfa_producer_service.init_app(app)
     extensions.storage_service.init_app(app, extensions.redis_service)
-    extensions.talisman.init_app(app, force_https=False)
+    extensions.talisman.init_app(
+        app,
+        force_https=app.config["HTTPS_ENFORCEMENT"],
+        session_cookie_secure=app.config["SESSION_COOKIE_SECURE"],
+        session_cookie_http_only=app.config["SESSION_COOKIE_HTTPONLY"],
+        strict_transport_security=True,
+    )
     extensions.csrf.init_app(app)
+
+
+def register_authority_guard(app: Flask):
+    """Reject malformed or untrusted request authorities before route handlers."""
+
+    @app.before_request
+    def require_trusted_authority():
+        host_headers = request.headers.getlist("Host")
+        if len(host_headers) != 1:
+            abort(400)
+        try:
+            authority = gateway_config.canonical_authority(host_headers[0])
+        except ValueError:
+            abort(400)
+        if authority not in app.config["TRUSTED_HOSTS"]:
+            abort(400)
 
 
 def register_hooks(app: Flask):
@@ -71,8 +132,34 @@ def register_hooks(app: Flask):
     """
 
     @app.before_request
+    def reject_query_credentials():
+        forbidden = {"access_token", "token", "refresh_token", "client_secret"}
+        if any(key.lower() in forbidden for key in request.args):
+            abort(400)
+
+    @app.before_request
     def make_session_permanent():
+        # Capability and credential metadata inspection must not refresh or
+        # otherwise mutate a browser session.
+        if (
+            request.endpoint == "account_verify" and request.method == "POST"
+        ) or (
+            request.endpoint in {"account_bootstrap", "account_personal_token"}
+            and request.method == "GET"
+        ):
+            return
         session.permanent = True
+
+
+    @app.after_request
+    def prevent_sensitive_response_storage(response):
+        if (
+            request.endpoint in SENSITIVE_ACCOUNT_ENDPOINTS
+            or request.path == "/accounts/verify"
+        ):
+            response.headers["Cache-Control"] = "no-store"
+            response.headers["Pragma"] = "no-cache"
+        return response
 
     @app.login_manager.user_loader
     def load_user(user_id):
@@ -129,9 +216,17 @@ def register_error_handlers(app: Flask):
     def validation_error(e):
         return jsonify({"message": e.value}), 400
 
+    @app.errorhandler(exceptions.AccountActionTokenError)
+    def invalid_account_action_token(e):
+        return jsonify({"message": e.value}), 400
+
     @app.errorhandler(exceptions.NoClientError)
     def no_client_error(e):
         return jsonify({"message": e.value}), 500
+
+    @app.errorhandler(400)
+    def on_400(e):
+        return jsonify({"message": "Bad request"}), 400
 
     @app.errorhandler(401)
     def on_401(e):
@@ -140,6 +235,10 @@ def register_error_handlers(app: Flask):
     @app.errorhandler(405)
     def on_405(e):
         return jsonify({"message": "Method not allowed"}), 405
+
+    @app.errorhandler(RequestEntityTooLarge)
+    def on_413(e):
+        return _request_too_large_response()
 
     @app.errorhandler(404)
     def on_404(e):
@@ -161,14 +260,14 @@ def register_verbose_exception_logging(app: Flask):
 
         app.logger.error(
             """
-            Request:     {method} {path}
+            Request:     {method} endpoint={endpoint}
             IP:          {ip}
             Agent:       {agent_platform} | {agent_browser} {agent_browser_version}
             Raw Agent:   {agent}
             Oauth2:      {oauth_user}
             """.format(
                 method=request.method,
-                path=request.path,
+                endpoint=request.endpoint,
                 ip=request.remote_addr,
                 agent_platform=request.user_agent.platform,
                 agent_browser=request.user_agent.browser,
@@ -184,26 +283,53 @@ def register_verbose_exception_logging(app: Flask):
 
 def register_views(flask_api: Api):
     """Registers the views for the Flask application."""
-    flask_api.add_resource(views.BootstrapView, "/accounts/bootstrap")
-    flask_api.add_resource(views.CSRFView, "/accounts/csrf")
+    flask_api.add_resource(
+        views.BootstrapView, "/accounts/bootstrap", endpoint="account_bootstrap"
+    )
+    flask_api.add_resource(views.CSRFView, "/accounts/csrf", endpoint="account_csrf")
     flask_api.add_resource(views.StatusView, "/accounts/status")
     flask_api.add_resource(views.OAuthProtectedView, "/accounts/protected")
-    flask_api.add_resource(views.UserAuthView, "/accounts/user/login")
+    flask_api.add_resource(
+        views.UserAuthView, "/accounts/user/login", endpoint="account_login"
+    )
     flask_api.add_resource(views.LogoutView, "/accounts/user/logout")
     flask_api.add_resource(views.UserManagementView, "/accounts/user")
     flask_api.add_resource(views.UserResolverView, "/accounts/user/<string:id>")
-    flask_api.add_resource(views.PersonalTokenView, "/accounts/user/token")
-    flask_api.add_resource(views.ChangePasswordView, "/accounts/user/change-password")
-    flask_api.add_resource(views.ChangeEmailView, "/accounts/user/change-email")
+    flask_api.add_resource(
+        views.PersonalTokenView,
+        "/accounts/user/token",
+        endpoint="account_personal_token",
+    )
+    flask_api.add_resource(
+        views.ChangePasswordView,
+        "/accounts/user/change-password",
+        endpoint="account_change_password",
+    )
+    flask_api.add_resource(
+        views.ChangeEmailView,
+        "/accounts/user/change-email",
+        endpoint="account_change_email",
+    )
 
     flask_api.add_resource(
         views.VerifyEmailView,
-        "/accounts/verify/<string:token>",
+        "/accounts/verify",
+        endpoint="account_verify",
+    )
+    flask_api.add_resource(
+        views.VerificationResendView,
         "/accounts/user/<string:email>/verify",
+        endpoint="account_verification_resend",
     )
     flask_api.add_resource(
         views.ResetPasswordView,
-        "/accounts/user/reset-password/<string:token_or_email>",
+        "/accounts/user/reset-password",
+        endpoint="account_reset_password",
+    )
+    flask_api.add_resource(
+        views.ResetPasswordVerifyView,
+        "/accounts/user/reset-password/verify",
+        endpoint="account_reset_password_verify",
     )
     flask_api.add_resource(views.UserInfoView, "/accounts/info/<string:account_data>")
     flask_api.add_resource(views.ChacheManagementView, "/admin/cache")
@@ -212,30 +338,58 @@ def register_views(flask_api: Api):
     flask_api.add_resource(views.Resources, "/resources")
 
 
-def create_app(**config):
-    """Create application and initialize dependencies.
+def sanitize_telemetry_request(span, environ):
+    """Remove query strings from request span attributes before export."""
+    if span is None or not span.is_recording():
+        return
+    path = "{}{}".format(
+        environ.get("SCRIPT_NAME", ""), environ.get("PATH_INFO", "")
+    ) or "/"
+    for attribute in ("http.target", "http.url", "url.full"):
+        span.set_attribute(attribute, path)
+    span.set_attribute("url.query", "")
 
-    Returns:
-        ADSFlask: Application object
+
+def create_app(*, allow_insecure_test_config=False, **local_config):
+    """Create the application and initialize its dependencies.
+
+    ``allow_insecure_test_config`` is a factory-only escape for explicit
+    network-facing test bypasses. It is accepted only together with
+    ``TESTING=True`` and cannot be supplied through application configuration.
     """
+    effective_config = {
+        key: value for key, value in vars(gateway_config).items() if key.isupper()
+    }
+    effective_config.update(local_config)
+    database_uri = effective_config.get("SQLALCHEMY_DATABASE_URI")
 
+    # ADSFlask v2 creates its own Flask-SQLAlchemy extension whenever a
+    # database URI is present. Suppress that initialization so the gateway's
+    # extension, which owns base_model, remains the sole database extension.
+    adsmutils_config = dict(effective_config)
+    adsmutils_config["SQLALCHEMY_DATABASE_URI"] = None
+
+    # ADSFlask v2 always invokes its legacy config loader. The repository root
+    # intentionally has no config.py, so pointing it there prevents a second
+    # environment pass from retyping values or logging secrets. The complete
+    # application configuration is supplied explicitly below.
     app = ADSFlask(
-        __name__,
+        _APP_NAME,
         static_folder=None,
         template_folder="templates",
-        local_config=config,
+        proj_home=str(_PROJECT_ROOT.parent),
+        local_config=adsmutils_config,
     )
+    app.config["SQLALCHEMY_DATABASE_URI"] = database_uri
 
-    # old baggage... Consul used to store keys in hexadecimal form
-    # so the production/staging databases both convert that into raw bytes
-    # but those raw bytes were non-ascii chars (unsafe to pass through
-    # env vars). So we must continue converting hex ...
-    if app.config.get("SECRET_KEY", None):
-        try:
-            app.config["SECRET_KEY"] = bytes.fromhex(app.config["SECRET_KEY"])
-            app.logger.warning("Converted SECRET_KEY from hex format into bytes")
-        except ValueError:
-            app.logger.warning("Most likely the SECRET_KEY is not in hex format")
+    gateway_config.validate_runtime_config(
+        app.config,
+        allow_insecure_test_config=allow_insecure_test_config,
+    )
+    trusted_proxy_hops = app.config["TRUSTED_PROXY_HOPS"]
+    if trusted_proxy_hops:
+        app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=trusted_proxy_hops)
+    register_authority_guard(app)
 
     # Service name is required for most backends,
     # and although it's not necessary for console export,
@@ -268,7 +422,7 @@ def create_app(**config):
                 meterProvider = MeterProvider(resource=resource, metric_readers=[reader])
                 metrics.set_meter_provider(meterProvider)
 
-    flask_api = Api(app)
+    flask_api = GatewayApi(app)
     register_verbose_exception_logging(app)
     register_extensions(app)
     register_hooks(app)

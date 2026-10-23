@@ -1,9 +1,12 @@
-from unittest.mock import MagicMock, call
+import datetime
+import hashlib
+
+from unittest.mock import MagicMock, PropertyMock, call, patch
 
 import pytest
 from flask import g, request
 
-from apigateway.exceptions import ValidationError
+from apigateway.exceptions import NoClientError
 from apigateway.models import OAuth2Client, OAuth2Token, User
 from apigateway.services import GatewayService
 
@@ -44,72 +47,6 @@ class TestGatewayService:
 
 
 class TestAuthService:
-    def test_load_client(self, app, mock_anon_user):
-        # Arrange
-        token = OAuth2Token(user_id=mock_anon_user.get_id(), access_token="test_token")
-        client = OAuth2Client(user_id=mock_anon_user.get_id(), client_id="test_client")
-
-        app.db.session.add(token)
-        app.db.session.add(client)
-        app.db.session.commit()
-
-        # Act
-        client, token = app.auth_service.load_client("test_client")
-
-        # Assert
-        assert client.client_id == "test_client"
-        assert token.user_id == mock_anon_user.get_id()
-
-    def test_bootstrap_anon_user(self, app, mock_anon_user):
-        # Act
-        client, token = app.auth_service.bootstrap_user()
-
-        # Assert
-        assert client.user_id == mock_anon_user.get_id()
-        assert token.user_id == mock_anon_user.get_id()
-        assert token.expires_in == app.config.get("BOOTSTRAP_TOKEN_EXPIRES")
-
-    def test_bootstrap_user(self, app, mock_regular_user):
-        # Act
-        client, token = app.auth_service.bootstrap_user()
-
-        # Assert
-        assert client.user_id == mock_regular_user.get_id()
-        assert token.user_id == mock_regular_user.get_id()
-
-    def test_bootstrap_user_no_capacity(self, app, mock_regular_user):
-        with pytest.raises(ValidationError):
-            _, _ = app.auth_service.bootstrap_user(ratelimit_multiplier=100)
-
-    def test_bootstrap_invalid_scope(self, app, mock_regular_user):
-        with pytest.raises(ValidationError):
-            _, _ = app.auth_service.bootstrap_user(scope="invalid")
-
-    def test_bootstrap_valid_scope(self, app, mock_regular_user):
-        try:
-            _, _ = app.auth_service.bootstrap_user(scope="test_scope")
-        except ValidationError:
-            pytest.fail("Unexpected ValidationError")
-
-    def test_headers_set(self, app, mock_regular_user):
-        _, token = app.auth_service.bootstrap_user()
-
-        @app.route("/test_auth_headers_set")
-        def test_route():
-            pass
-
-        with app.test_request_context(
-            "/test_auth_headers_set",
-            headers={
-                "Authorization": "Bearer " + token.access_token,
-            },
-        ):
-            # Manually call before_request functions
-            for func in app.before_request_funcs[None]:
-                func()
-
-            assert "X-api-uid" in request.headers
-
 
     def test_headers_not_set(self, app):
 
@@ -224,20 +161,31 @@ class TestAuthService:
 
             assert "X-Access-Modality" not in request.headers
 
-    def test_modality_header_real_api_client(self, app, mock_regular_user):
-        # Exercise the real relationship/metadata path (not a MagicMock): a token
-        # whose OAuth2Client metadata names it an API client resolves to "api".
-        mock_regular_user.is_authenticated = False
-
-        client = OAuth2Client(user_id=mock_regular_user.get_id(), client_id="real_api_client")
-        client.set_client_metadata({"client_name": "ADS API client"})
-        token = OAuth2Token(
-            user_id=mock_regular_user.get_id(),
-            client_id=client.id,
-            access_token="real_api_token",
+    def test_modality_header_real_api_client(self, app):
+        user = User(
+            email="real-api@example.test",
+            fs_uniquifier="real-api-user",
+            active=True,
         )
-        token.client = client
-        token.user = mock_regular_user
+        client = OAuth2Client(
+            user_id=user.fs_uniquifier,
+            client_id="real-api-client",
+            credential_purpose="operator",
+        )
+        client.set_client_metadata({"client_name": "ADS API client", "scope": "api"})
+        app.db.session.add_all([user, client])
+        app.db.session.flush()
+        token = OAuth2Token(
+            user_id=user.fs_uniquifier,
+            client_id=client.id,
+            access_token=hashlib.sha256(b"real-api-token").hexdigest(),
+            token_key_id=app.config["ACCESS_TOKEN_HMAC_ACTIVE_KEY_ID"],
+            token_digest_version=1,
+            credential_purpose="operator",
+            expires_in=3600,
+        )
+        app.db.session.add(token)
+        app.db.session.commit()
 
         with app.test_request_context("/test_modality_real_api"):
             g.pop("access_modality", None)
@@ -245,6 +193,87 @@ class TestAuthService:
 
             assert request.headers["X-Access-Modality"] == "api"
             assert len(request.headers.getlist("X-Access-Modality")) == 1
+
+    def test_bearer_activity_rejects_clientless_token(self, app):
+        user = User(
+            email="clientless@example.test",
+            fs_uniquifier="clientless-user",
+            active=True,
+        )
+        app.db.session.add(user)
+        app.db.session.commit()
+        token = OAuth2Token(
+            user_id=user.fs_uniquifier,
+            client_id=None,
+            access_token="clientless-access",
+        )
+        token.user = user
+
+        with app.test_request_context("/clientless"):
+            with pytest.raises(NoClientError):
+                app.auth_service._token_authenticated(sender=None, token=token)
+
+    def test_bearer_activity_is_durable_and_throttled(self, app):
+        user = User(
+            email="activity@example.test",
+            fs_uniquifier="activity-user",
+            active=True,
+        )
+        client = OAuth2Client(
+            user_id=user.fs_uniquifier,
+            client_id="activity-client",
+            credential_purpose="operator",
+            last_activity=datetime.datetime.utcnow() - datetime.timedelta(days=1),
+        )
+        client.set_client_metadata({"client_name": "ADS API client", "scope": "api"})
+        app.db.session.add_all([user, client])
+        app.db.session.flush()
+        token = OAuth2Token(
+            user_id=user.fs_uniquifier,
+            client_id=client.id,
+            token_type="Bearer",
+            access_token=hashlib.sha256(b"activity-access").hexdigest(),
+            token_key_id=app.config["ACCESS_TOKEN_HMAC_ACTIVE_KEY_ID"],
+            token_digest_version=1,
+            credential_purpose="operator",
+            scope="api",
+            expires_in=3600,
+        )
+        app.db.session.add(token)
+        app.db.session.commit()
+
+        with app.test_request_context("/activity"):
+            app.auth_service._token_authenticated(sender=None, token=token)
+
+        app.db.session.refresh(client)
+        first_activity = client.last_activity
+        assert first_activity > datetime.datetime.utcnow() - datetime.timedelta(minutes=1)
+
+        with app.test_request_context("/activity-again"):
+            app.auth_service._token_authenticated(sender=None, token=token)
+
+        app.db.session.refresh(client)
+        assert client.last_activity == first_activity
+
+    def test_bearer_activity_rejects_disappeared_client(self, app):
+        user = User(
+            email="missing-client@example.test",
+            fs_uniquifier="missing-client-user",
+            active=True,
+        )
+        app.db.session.add(user)
+        app.db.session.commit()
+        token = OAuth2Token(
+            user_id=user.fs_uniquifier,
+            client_id=999999,
+            access_token="missing-client-access",
+        )
+        token.user = user
+
+        with app.test_request_context("/missing-client"):
+            with pytest.raises(NoClientError):
+                app.auth_service._token_authenticated(sender=None, token=token)
+
 
 
 class TestProxyService:
@@ -455,6 +484,108 @@ class TestLimiterService:
         # Assert
         assert counter2 == 9  # 9 because of rate limit multiplier of 3 for current user
 
+    def test_adaptive_cost_uses_prior_completed_mean_and_charges_surcharge(self, app):
+        service = app.limiter_service
+        request_limit = MagicMock()
+        request_limit.limit = MagicMock()
+        request_limit.request_args = ["/slow", "scope"]
+        request_limit.key = "/slow:identity:scope"
+        request_limit.scope = "endpoint-scope"
+        app.config.update(
+            LIMITER_SERVICE_SCALING_COST_ENABLED=True,
+            LIMITER_SERVICE_SCALING_COST_THRESHOLD=100,
+            LIMITER_SERVICE_MAX_COST=10,
+        )
+        with app.test_request_context("/slow"), patch.object(
+            service, "_key_func", return_value="/slow"
+        ), patch(
+            "apigateway.services.time.monotonic_ns", return_value=8_000_000_000
+        ), patch(
+            "apigateway.services.extensions.storage_service.atomic_snapshot_and_add",
+            return_value=(100_000_000, 100),
+        ) as aggregate, patch.object(
+            type(service), "current_limits", new_callable=PropertyMock, return_value=[request_limit]
+        ), patch.object(
+            service.limiter, "hit"
+        ) as hit:
+            cost = service._record_completed_request(0)
+
+        assert cost == 10
+        digest = hashlib.sha256(
+            b'["/slow:identity:scope","endpoint-scope"]'
+        ).hexdigest()
+        aggregate.assert_called_once_with(
+            f"LIMITER_SERVICE//adaptive/{digest}/total_microseconds",
+            f"LIMITER_SERVICE//adaptive/{digest}/count",
+            8_000_000,
+            600,
+        )
+        hit.assert_called_once_with(request_limit.limit, "/slow", "scope", cost=9)
+
+    def test_adaptive_accounting_runs_after_handler_and_explicit_cost_opts_out(self, app):
+        service = app.limiter_service
+        events = []
+        app.config["LIMITER_SERVICE_SCALING_COST_ENABLED"] = True
+
+        adaptive = service.shared_limit("100/minute")(
+            lambda: events.append("handler")
+        )
+        explicit = service.shared_limit("100/minute", cost=3)(
+            lambda: events.append("explicit-handler")
+        )
+        with app.test_request_context("/ordered"), patch.object(
+            service, "check", side_effect=lambda: events.append("check")
+        ), patch(
+            "apigateway.services.time.monotonic_ns", return_value=123
+        ), patch.object(
+            service,
+            "_record_completed_request",
+            side_effect=lambda started: events.append(("record", started)),
+        ) as record:
+            adaptive()
+            explicit()
+
+        assert events == [
+            "check",
+            "handler",
+            ("record", 123),
+            "check",
+            "explicit-handler",
+        ]
+        record.assert_called_once_with(123)
+
+    def test_adaptive_accounting_skips_failed_handlers(self, app):
+        service = app.limiter_service
+        app.config["LIMITER_SERVICE_SCALING_COST_ENABLED"] = True
+
+        def fail():
+            raise RuntimeError("handler failed")
+
+        adaptive = service.shared_limit("100/minute")(fail)
+        with app.test_request_context("/failed"), patch.object(
+            service, "check"
+        ), patch.object(service, "_record_completed_request") as record:
+            with pytest.raises(RuntimeError):
+                adaptive()
+        record.assert_not_called()
+
+    def test_zero_prior_mean_is_clamped_to_base_cost(self, app):
+        service = app.limiter_service
+        app.config["LIMITER_SERVICE_SCALING_COST_ENABLED"] = True
+        with app.test_request_context("/zero"), patch.object(
+            service, "_key_func", return_value="/zero"
+        ), patch(
+            "apigateway.services.time.monotonic_ns", return_value=1_000_000
+        ), patch(
+            "apigateway.services.extensions.storage_service.atomic_snapshot_and_add",
+            return_value=(0, 100),
+        ), patch.object(
+            type(service), "current_limits", new_callable=PropertyMock, return_value=[]
+        ):
+            assert service._record_completed_request(0) == 1
+
+
+
 
 class TestSecurityService:
     def test_create_user(self, app):
@@ -491,28 +622,34 @@ class TestSecurityService:
         assert updated_user.password != new_password
         assert updated_user.validate_password(new_password)
 
+    def test_change_password_can_join_caller_transaction(self, app):
+        user = app.security_service.create_user(
+            "transactional-password@gmail.com", "Old_valid_password1"
+        )
+
+        updated_user = app.security_service.change_password(
+            user,
+            "New_valid_password1",
+            session=app.db.session,
+            commit=False,
+        )
+        assert updated_user.validate_password("New_valid_password1")
+
+        app.db.session.rollback()
+        persisted_user = app.db.session.query(User).filter_by(id=user.id).one()
+        assert persisted_user.validate_password("Old_valid_password1")
+        assert not persisted_user.validate_password("New_valid_password1")
+
     def test_validate_email(self, app):
         valid_email = "test@gmail.com"
         invalid_email = "test"
         assert app.security_service.validate_email(valid_email) is True
         assert app.security_service.validate_email(invalid_email) is False
 
-    def test_change_email(self, app):
-        email = "test@gmail.com"
-        password = "test_password"
-        user = app.security_service.create_user(email, password)
-        new_email = "new_test@gmail.com"
-        updated_user = app.security_service.change_email(user, new_email)
-        assert updated_user.email == new_email
 
-    def test_generate_email_token(self, app, mock_regular_user):
-        token = app.security_service.generate_email_token()
-        assert isinstance(token, str)
-
-    def test_verify_email_token(self, app, mock_regular_user):
-        user = app.security_service.create_user(
-            mock_regular_user.email, "test_password", id=mock_regular_user.id
-        )
-        token = app.security_service.generate_email_token()
-        user = app.security_service.verify_email_token(token)
-        assert isinstance(user, User)
+    def test_legacy_email_capability_service_is_removed(self, app):
+        assert not hasattr(app.security_service, "change_email")
+        assert not hasattr(app.security_service, "generate_email_token")
+        assert not hasattr(app.security_service, "verify_email_token")
+        assert not hasattr(app.security_service, "generate_token")
+        assert not hasattr(app.security_service, "verify_token")
