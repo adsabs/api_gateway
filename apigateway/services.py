@@ -1,20 +1,25 @@
 """Module defining API Gateway services."""
 
 import hashlib
+import hmac
 import json
 import logging
 import math
 import os
 import re
+import secrets
+import threading
 import time
-from datetime import datetime
+import uuid
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from functools import wraps
 from typing import Callable, Tuple
 from urllib.parse import urljoin
 
 import requests
 from authlib.integrations.flask_oauth2 import current_token, token_authenticated
-from authlib.integrations.sqla_oauth2 import create_bearer_token_validator
+from authlib.oauth2.rfc6750 import BearerTokenValidator
 from cachelib.serializers import RedisSerializer
 from flask import Flask, current_app, g, request
 from flask.wrappers import Response
@@ -24,18 +29,29 @@ from flask_limiter.extension import LimitDecorator
 from flask_limiter.util import get_remote_address
 from flask_login import current_user
 from flask_security import Security, SQLAlchemyUserDatastore
-from itsdangerous import URLSafeTimedSerializer
+from itsdangerous import URLSafeSerializer
 from kafka import KafkaProducer
 from redis import Redis, StrictRedis
 from redis.exceptions import ConnectionError, TimeoutError
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from werkzeug.datastructures import Headers
-from werkzeug.security import gen_salt
 
 from apigateway import extensions
-from apigateway.exceptions import NoClientError, NotFoundError, ValidationError
-from apigateway.models import AnonymousUser, OAuth2Client, OAuth2Token, Role, User
+from apigateway.domains import canonicalize_email
+from apigateway.exceptions import (
+    AccountActionTokenError,
+    ValidationError,
+)
+from apigateway.models import (
+    AccountActionToken,
+    AnonymousUser,
+    OAuth2Client,
+    OAuth2Token,
+    Role,
+    User,
+)
 from apigateway.utils import GatewayResourceProtector, ProxyView
+
 
 
 class GatewayService:
@@ -80,6 +96,29 @@ class GatewayService:
         return self._app.config.get(self._name + "_" + key, default)
 
 
+@dataclass(frozen=True)
+class IssuedCredential:
+    """A raw credential paired with the persisted non-secret records."""
+
+    client: OAuth2Client
+    token: OAuth2Token
+    access_token: str
+
+
+class DigestBearerTokenValidator(BearerTokenValidator):
+    """Authenticate raw bearer values against accepted keyed digests."""
+
+    def __init__(self, service):
+        super().__init__()
+        self.service = service
+
+    def authenticate_token(self, token_string):
+        return self.service.lookup_access_token(token_string)
+
+    def token_revoked(self, token):
+        return bool(getattr(token, "revoked", False))
+
+
 class AuthService(GatewayService):
     """A class that provides authentication services for the API Gateway."""
 
@@ -101,8 +140,12 @@ class AuthService(GatewayService):
             app (Flask): The Flask app to initialize the AuthService with.
         """
         super().init_app(app)
-        bearer_cls = create_bearer_token_validator(extensions.db.session, OAuth2Token)
-        self.require_oauth.register_token_validator(bearer_cls())
+        self._access_token_keys = app.config["ACCESS_TOKEN_HMAC_KEYS"]
+        self._active_access_token_key_id = app.config[
+            "ACCESS_TOKEN_HMAC_ACTIVE_KEY_ID"
+        ]
+        self.accepted_access_token_key_ids = tuple(self._access_token_keys)
+        self.require_oauth.register_token_validator(DigestBearerTokenValidator(self))
         self._register_hooks(app)
 
     def _register_hooks(self, app: Flask):
@@ -146,247 +189,382 @@ class AuthService(GatewayService):
 
         request.headers = headers
 
-    def load_client(self, client_id: str) -> Tuple[OAuth2Client, OAuth2Token]:
-        """Loads the OAuth2Client and OAuth2Token for the given client_id.
+    def digest_access_token(self, raw_token: str, key_id: str = None) -> str:
+        """Return the versioned HMAC digest used for bearer lookup."""
+        if not isinstance(raw_token, str) or not raw_token:
+            return ""
+        selected_key_id = key_id or self._active_access_token_key_id
+        key = self._access_token_keys[selected_key_id]
+        return hmac.new(
+            key, ("v1:" + raw_token).encode("utf-8"), hashlib.sha256
+        ).hexdigest()
 
-        Args:
-            client_id (str): The ID of the client to load.
+    def lookup_access_token(self, raw_token: str):
+        candidates = [
+            (key_id, self.digest_access_token(raw_token, key_id))
+            for key_id in self.accepted_access_token_key_ids
+        ]
+        if not candidates:
+            return None
+        return (
+            extensions.db.session.query(OAuth2Token)
+            .filter(
+                or_(
+                    *[
+                        (
+                            (OAuth2Token.token_key_id == key_id)
+                            & (OAuth2Token.access_token == digest)
+                        )
+                        for key_id, digest in candidates
+                    ]
+                )
+            )
+            .first()
+        )
 
-        Raises:
-            NoClientError: If the client with the given ID is not found.
+    _ANONYMOUS_ADMISSION_SCRIPT = """
+local source_count = redis.call('INCR', KEYS[1])
+if source_count == 1 then redis.call('EXPIRE', KEYS[1], ARGV[2]) end
+local global_count = redis.call('INCR', KEYS[2])
+if global_count == 1 then redis.call('EXPIRE', KEYS[2], ARGV[4]) end
+if source_count > tonumber(ARGV[1]) or global_count > tonumber(ARGV[3]) then
+    return 0
+end
+return 1
+"""
 
-        Returns:
-            Tuple[OAuth2Client, OAuth2Token]: A tuple containing the OAuth2Client and OAuth2Token for the given client_id.
-        """
-        client = OAuth2Client.query.filter_by(client_id=client_id).first()
+    @staticmethod
+    def _fixed_window_limit(value):
+        counts, remainder = value.split("/", 1)
+        seconds = remainder.split(" ", 1)[0]
+        return int(counts), int(seconds)
 
+    def admit_anonymous_issuance(self, source: str) -> bool:
+        """Atomically enforce authoritative source and global Redis limits."""
+        source_limit, source_window = self._fixed_window_limit(
+            self._app.config["ANONYMOUS_ISSUANCE_SOURCE_LIMIT"]
+        )
+        global_limit, global_window = self._fixed_window_limit(
+            self._app.config["ANONYMOUS_ISSUANCE_GLOBAL_LIMIT"]
+        )
+        now = int(time.time())
+        source_bucket = now // source_window
+        global_bucket = now // global_window
+        source_digest = hashlib.sha256(
+            (source or "unknown").encode("utf-8")
+        ).hexdigest()
+        result = extensions.redis_service.eval(
+            self._ANONYMOUS_ADMISSION_SCRIPT,
+            2,
+            "oauth:anonymous:source:{}:{}".format(source_digest, source_bucket),
+            "oauth:anonymous:global:{}".format(global_bucket),
+            source_limit,
+            source_window + 1,
+            global_limit,
+            global_window + 1,
+        )
+        return int(result) == 1
+
+    @staticmethod
+    def binding_digest(binding_id: str) -> str:
+        if not isinstance(binding_id, str) or not binding_id:
+            raise ValidationError("A browser binding is required")
+        return hashlib.sha256(("oauth-browser-v1:" + binding_id).encode()).hexdigest()
+
+    def get_credential_metadata(
+        self, owner, *, purpose: str, binding_digest: str = None
+    ):
+        """Return non-secret metadata for an owner's current credential."""
+        query = OAuth2Client.query.filter_by(
+            user_id=owner.get_id(), credential_purpose=purpose
+        )
+        if purpose == "anonymous":
+            if not binding_digest:
+                return None
+            query = query.filter_by(binding_digest=binding_digest)
+        client = query.order_by(OAuth2Client.id.desc()).first()
         if client is None:
-            raise NoClientError(f"Client {client_id} not found")
-
-        token = OAuth2Token.query.filter_by(client_id=client.id).first()
-
-        if token is None or token.is_expired():
-            token = self._create_temporary_token(client)
-            extensions.db.session.add(token)
-
-        client.last_activity = datetime.now()
-        extensions.db.session.add(client)
-        extensions.db.session.commit()
-
-        return client, token
-
-    def bootstrap_user(
-        self,
-        client_name: str = None,
-        scope: str = None,
-        ratelimit_multiplier: float = 1.0,
-        expires: datetime = datetime(2050, 1, 1),
-        create_client: bool = False,
-        individual_ratelimit_multipliers: dict = None,
-    ) -> Tuple[OAuth2Client, OAuth2Token]:
-        """Bootstraps a user with an OAuth2Client and OAuth2Token.
-
-        Args:
-            client_name (type, optional): The name of the client. Defaults to None.
-            scopes (type, optional): The scopes for the client. Defaults to None.
-            ratelimit_multiplier (float, optional): The ratelimit factor for the client. Defaults to 1.0.
-            expires (type, optional): The expiration date for the token. Defaults to datetime(2050, 1, 1).
-            create_client (bool, optional): Whether to create a new client or not. Defaults to False.
-            individual_ratelimit_multipliers (dict, optional): A dictionary of individual ratelimit multipliers for specific endpoints. Defaults to None.
-
-        Returns:
-            Tuple[OAuth2Client, OAuth2Token]: A tuple containing the OAuth2Client and OAuth2Token for the user.
-        """
-        if current_user.is_anonymous_bootstrap_user:
-            return self.bootstrap_anonymous_user()
-
-        client_name = client_name or self._app.config.get("BOOTSTRAP_CLIENT_NAME", "BB client")
-
-        clients = (
-            OAuth2Client.query.filter_by(user_id=current_user.get_id())
-            .order_by(OAuth2Client.client_id_issued_at.desc())
-            .all()
-        )
-
-        # Metadata is a computed property so we need to filter after the query
-        client = next((c for c in clients if c.client_name == client_name), None)
-
-        if client is None or create_client:
-            self._validate_ratelimit(ratelimit_multiplier)
-            self._validate_scopes(scope)
-
-            client = OAuth2Client(
-                user_id=current_user.get_id(),
-                ratelimit_multiplier=ratelimit_multiplier,
-                individual_ratelimit_multipliers=individual_ratelimit_multipliers,
-                last_activity=datetime.now(),
-            )
-            client.set_client_metadata(
-                {
-                    "client_name": client_name,
-                    "description": client_name,
-                    "scope": scope or " ".join(self._app.config.get("USER_DEFAULT_SCOPES", "")),
-                }
-            )
-
-            client.gen_salt()
-            extensions.db.session.add(client)
-            extensions.db.session.flush()
-
-            token = self._create_user_token(client, expires=expires)
-            extensions.db.session.add(token)
-
-            self._logger.info("Created BB client for {email}".format(email=current_user.email))
-        else:
-            token = OAuth2Token.query.filter_by(
+            return None
+        token = (
+            OAuth2Token.query.filter_by(
                 client_id=client.id,
-                user_id=current_user.get_id(),
-            ).first()
-
-            if token is None:
-                token = self._create_user_token(client, expires=expires)
-
-                extensions.db.session.add(token)
-                self._logger.info("Created BB client for {email}".format(email=current_user.email))
-
-            client.last_activity = datetime.now()
-            extensions.db.session.add(client)
-
-        extensions.db.session.commit()
-
+                user_id=owner.get_id(),
+                credential_purpose=purpose,
+            )
+            .order_by(OAuth2Token.id.desc())
+            .first()
+        )
+        if token is None or token.is_expired():
+            return None
         return client, token
 
-    def bootstrap_anonymous_user(self) -> Tuple[OAuth2Client, OAuth2Token]:
-        """Bootstraps an anonymous user with an OAuth2Client and OAuth2Token.
-
-        Raises:
-            ValidationError: If the current user is not an anonymous bootstrap user.
-
-        Returns:
-            Tuple[OAuth2Client, OAuth2Token]: A tuple containing the OAuth2Client and OAuth2Token for the anonymous user.
-        """
-        if not current_user.is_anonymous_bootstrap_user:
-            raise ValidationError("Only anonymous bootstrap user can create temporary tokens")
-
-        client = OAuth2Client(
-            user_id=current_user.get_id(),
-            last_activity=datetime.now(),
-        )
-
-        client.set_client_metadata(
-            {
-                "client_name": self._app.config.get("BOOTSTRAP_CLIENT_NAME", "BB client"),
-                "description": "Anonymous client",
-                "scope": " ".join(self._app.config.get("BOOTSTRAP_SCOPES", "")),
-            }
-        )
-
-        client.gen_salt()
-        extensions.db.session.add(client)
-        extensions.db.session.flush()
-
-        token = self._create_temporary_token(client)
-        extensions.db.session.add(token)
-        extensions.db.session.commit()
-
-        return client, token
-
-    def _create_user_token(
+    def issue_credential(
         self,
-        client: OAuth2Client,
-        expires=datetime(2050, 1, 1),
-    ) -> OAuth2Token:
-        """Creates an OAuth2Token for the given OAuth2Client.
+        owner,
+        *,
+        purpose: str,
+        scopes=None,
+        expires_in: int = None,
+        client_name: str = None,
+        ratelimit_multiplier: float = 1.0,
+        individual_ratelimit_multipliers: dict = None,
+        binding_digest: str = None,
+        rotate: bool = True,
+    ) -> IssuedCredential:
+        """Create or rotate a bearer credential in one locked transaction.
 
-        Args:
-            client (OAuth2Client): The OAuth2Client to create the token for.
-            expires (type, optional): The expiration date for the token. Defaults to datetime(2050, 1, 1).
-
-        Returns:
-            OAuth2Token: The created OAuth2Token.
+        ``owner`` is explicit by design: this policy primitive never derives
+        authorization from Flask's ``current_user``.
         """
-        salt_length = self._app.config.get("OAUTH2_CLIENT_ID_SALT_LEN", 40)
+        db_session = extensions.db.session
+        try:
+            locked_owner = self._lock_owner(db_session, owner)
+            self._validate_owner_and_purpose(
+                locked_owner, purpose, binding_digest=binding_digest
+            )
+            resolved_scopes = self._resolve_and_validate_scopes(
+                locked_owner, purpose, scopes
+            )
+            lifetime = self._validate_expiry(purpose, expires_in)
+            base_capacity, route_capacities = self._validate_capacities(
+                ratelimit_multiplier, individual_ratelimit_multipliers
+            )
 
-        token = OAuth2Token(
-            token_type="bearer",
-            client_id=client.id,
-            user_id=client.user_id,
-            access_token=gen_salt(salt_length),
-            refresh_token=gen_salt(salt_length),
-            scope=client.scope,
-            expires_in=(expires - datetime.now()).total_seconds(),
+            existing = self._find_locked_client(
+                db_session,
+                locked_owner,
+                purpose,
+                binding_digest=binding_digest,
+            )
+            if existing is not None and not rotate:
+                raise ValidationError("An active credential already exists")
+
+            requested_capacity = max(
+                [base_capacity] + list(route_capacities.values())
+            )
+            self._enforce_quota(
+                db_session,
+                locked_owner,
+                requested_capacity,
+                purpose,
+                existing_client=existing,
+            )
+
+            if existing is None:
+                client = OAuth2Client(
+                    user_id=locked_owner.get_id(),
+                    ratelimit_multiplier=base_capacity,
+                    individual_ratelimit_multipliers=route_capacities or None,
+                    last_activity=datetime.now(),
+                    credential_purpose=purpose,
+                    binding_digest=binding_digest,
+                )
+                client.set_client_metadata(
+                    {
+                        "client_name": client_name
+                        or self._default_client_name(purpose),
+                        "description": client_name
+                        or self._default_client_name(purpose),
+                        "scope": " ".join(resolved_scopes),
+                    }
+                )
+                client.gen_salt()
+                db_session.add(client)
+                db_session.flush()
+            else:
+                client = existing
+                client.ratelimit_multiplier = base_capacity
+                client.individual_ratelimit_multipliers = route_capacities or None
+                client.last_activity = datetime.now()
+                client.set_client_metadata(
+                    {
+                        "client_name": client_name or client.client_name,
+                        "description": client_name or client.client_name,
+                        "scope": " ".join(resolved_scopes),
+                    }
+                )
+                db_session.query(OAuth2Token).filter_by(client_id=client.id).delete(
+                    synchronize_session=False
+                )
+
+            raw_token = secrets.token_urlsafe(32)
+            token = OAuth2Token(
+                token_type="Bearer",
+                client_id=client.id,
+                user_id=locked_owner.get_id(),
+                access_token=self.digest_access_token(raw_token),
+                token_key_id=self._active_access_token_key_id,
+                token_digest_version=1,
+                scope=" ".join(resolved_scopes),
+                expires_in=lifetime,
+                credential_purpose=purpose,
+                is_personal=purpose in {"personal", "operator"},
+            )
+            db_session.add(token)
+            db_session.commit()
+            return IssuedCredential(client, token, raw_token)
+        except Exception:
+            db_session.rollback()
+            raise
+
+    def _lock_owner(self, db_session, owner):
+        query = db_session.query(User)
+        if isinstance(owner, User):
+            if owner.id is not None:
+                query = query.filter(User.id == owner.id)
+            else:
+                query = query.filter(User.fs_uniquifier == owner.get_id())
+        elif isinstance(owner, str):
+            query = query.filter(
+                or_(User.fs_uniquifier == owner, User.email == owner)
+            )
+        else:
+            raise ValidationError("A valid credential owner is required")
+        locked_owner = query.with_for_update().one_or_none()
+        if locked_owner is None:
+            raise ValidationError("Credential owner not found")
+        return locked_owner
+
+    def _validate_owner_and_purpose(self, owner, purpose, *, binding_digest):
+        if purpose not in {"anonymous", "browser", "personal", "operator"}:
+            raise ValidationError("Invalid credential purpose")
+        if not owner.active:
+            raise ValidationError("Credential owner is inactive")
+        if purpose == "anonymous":
+            if not owner.is_anonymous_bootstrap_user or not binding_digest:
+                raise ValidationError("Invalid anonymous credential owner or binding")
+        elif owner.is_anonymous_bootstrap_user:
+            raise ValidationError("Anonymous owners cannot receive this credential")
+
+    def _default_client_name(self, purpose):
+        if purpose in {"personal", "operator"}:
+            return "ADS API client"
+        return self._app.config.get("BOOTSTRAP_CLIENT_NAME", "BB client")
+
+    def _resolve_and_validate_scopes(self, owner, purpose, scopes):
+        if scopes is None:
+            key = (
+                "BOOTSTRAP_SCOPES"
+                if purpose == "anonymous"
+                else "USER_API_DEFAULT_SCOPES"
+                if purpose in {"personal", "operator"}
+                else "USER_DEFAULT_SCOPES"
+            )
+            scopes = self._app.config.get(key, [])
+        elif isinstance(scopes, str):
+            scopes = scopes.split()
+        if not isinstance(scopes, (list, tuple)) or any(
+            not isinstance(scope, str) or not scope for scope in scopes
+        ):
+            raise ValidationError("Scopes must be a list of non-empty strings")
+        resolved = tuple(dict.fromkeys(scopes))
+        allowed = set(owner.allowed_scopes)
+        if "*" not in allowed and not allowed.issuperset(resolved):
+            raise ValidationError("Requested scopes exceed the owner's allowed scopes")
+        return resolved
+
+    def _validate_expiry(self, purpose, expires_in):
+        maximum = 24 * 60 * 60 if purpose == "anonymous" else 30 * 24 * 60 * 60
+        if expires_in is None:
+            expires_in = (
+                self._app.config.get("BOOTSTRAP_TOKEN_EXPIRES", maximum)
+                if purpose == "anonymous"
+                else self._app.config.get("PERSONAL_TOKEN_EXPIRES", maximum)
+            )
+        if (
+            isinstance(expires_in, bool)
+            or not isinstance(expires_in, (int, float))
+            or not math.isfinite(expires_in)
+            or expires_in <= 0
+            or expires_in > maximum
+        ):
+            raise ValidationError("Credential lifetime is outside the allowed bound")
+        return int(expires_in)
+
+    def _validate_capacities(self, base, routes):
+        def valid(value):
+            return (
+                not isinstance(value, bool)
+                and isinstance(value, (int, float))
+                and math.isfinite(value)
+                and value > 0
+            )
+
+        if not valid(base):
+            raise ValidationError("Rate-limit capacity must be finite and positive")
+        if routes is None:
+            return float(base), {}
+        if not isinstance(routes, dict):
+            raise ValidationError("Route capacities must be an object")
+        registered = set(self._app.view_functions)
+        normalized = {}
+        for endpoint, value in routes.items():
+            if (
+                not isinstance(endpoint, str)
+                or endpoint not in registered
+                or not valid(value)
+            ):
+                raise ValidationError(
+                    "Route capacities require exact registered endpoint names "
+                    "and finite positive values"
+                )
+            normalized[endpoint] = float(value)
+        return float(base), normalized
+
+    def _find_locked_client(
+        self, db_session, owner, purpose, *, binding_digest=None
+    ):
+        query = db_session.query(OAuth2Client).filter_by(
+            user_id=owner.get_id(), credential_purpose=purpose
         )
+        if purpose == "anonymous":
+            query = query.filter_by(binding_digest=binding_digest)
+        return query.with_for_update().first()
 
-        return token
+    @staticmethod
+    def _client_capacity(client):
+        route_values = (client.individual_ratelimit_multipliers or {}).values()
+        return max([client.ratelimit_multiplier] + list(route_values))
 
-    def _create_temporary_token(self, client: OAuth2Client) -> OAuth2Token:
-        """Creates a temporary OAuth2Token for the given OAuth2Client.
-
-        Args:
-            client (OAuth2Client): The OAuth2Client to create the token for.
-
-        Raises:
-            ValidationError: If the current user is not an anonymous bootstrap user.
-
-        Returns:
-            OAuth2Token: The created temporary OAuth2Token.
-        """
-        if not current_user.is_anonymous_bootstrap_user:
-            raise ValidationError("Only bootstrap user can create temporary tokens")
-
-        salt_length = self._app.config.get("OAUTH2_CLIENT_ID_SALT_LEN", 40)
-        expires_in: int = self._app.config.get("BOOTSTRAP_TOKEN_EXPIRES", 3600 * 24)
-
-        return OAuth2Token(
-            token_type="bearer",
-            client_id=client.id,
-            user_id=client.user_id,
-            access_token=gen_salt(salt_length),
-            refresh_token=gen_salt(salt_length),
-            scope=client.scope,
-            expires_in=expires_in,
-        )
-
-    def _validate_ratelimit(self, requested_ratelimit: float):
-        """
-        Check if the current user has enough capacity to create a new client.
-
-        Args:
-            requested_ratelimit (float): The amount of capacity requested for the new client.
-
-        Raises:
-            ValidationError: If the current user account does not have enough capacity to create a new client.
-        """
-        quota = current_user.ratelimit_quota or 2.0
+    def _enforce_quota(
+        self, db_session, owner, requested, purpose, *, existing_client=None
+    ):
+        quota = owner.ratelimit_quota
+        if quota is None:
+            quota = self._app.config.get("AUTH_SERVICE_DEFAULT_OWNER_QUOTA", 2.0)
+        if (
+            isinstance(quota, bool)
+            or not isinstance(quota, (int, float))
+            or not math.isfinite(quota)
+            or (quota < 0 and quota != -1)
+        ):
+            raise ValidationError("Owner rate-limit quota is invalid")
+        if quota == 0:
+            raise ValidationError("Credential issuance is suspended")
+        if purpose == "anonymous" and existing_client is None:
+            cap = self._app.config["ANONYMOUS_CREDENTIAL_DATABASE_CAP"]
+            count = (
+                db_session.query(func.count(OAuth2Client.id))
+                .filter(OAuth2Client.credential_purpose == "anonymous")
+                .scalar()
+            )
+            if count >= cap:
+                raise ValidationError("Anonymous credential capacity is exhausted")
         if quota == -1:
             return
-
-        used_ratelimit = (
-            extensions.db.session.query(func.sum(OAuth2Client.ratelimit_multiplier).label("sum"))
-            .filter(OAuth2Client.user_id == current_user.get_id())
-            .first()[0]
-            or 0.0
+        query = (
+            db_session.query(OAuth2Client)
+            .join(OAuth2Token)
+            .filter(
+                OAuth2Client.user_id == owner.get_id(),
+                OAuth2Token.issued_at + OAuth2Token.expires_in > int(time.time()),
+            )
         )
-
-        if quota - (used_ratelimit + requested_ratelimit) < 0:
-            raise ValidationError(
-                "The current user account (%s) does not have enough capacity to create a new client. Requested: %s, Available: %s"
-                % (current_user.email, requested_ratelimit, quota - used_ratelimit)
-            )
-
-    def _validate_scopes(self, scopes: str):
-        allowed_scopes = set(current_user.allowed_scopes)
-
-        if "*" in allowed_scopes or scopes is None:
-            return
-
-        requested_scopes = set(scopes.split())
-
-        if not allowed_scopes.issuperset(requested_scopes):
-            raise ValidationError(
-                "The current user account (%s) does not have the requested scopes. Requested: %s, Allowed: %s"
-                % (current_user.email, requested_scopes, allowed_scopes)
-            )
+        if existing_client is not None:
+            query = query.filter(OAuth2Client.id != existing_client.id)
+        used = sum(self._client_capacity(client) for client in query.all())
+        if used + requested > quota:
+            raise ValidationError("Owner credential quota is exhausted")
 
 
 class ProxyService(GatewayService):
@@ -414,17 +592,20 @@ class ProxyService(GatewayService):
 
         @app.after_request
         def _after_request_hook(response: Response):
+            if not getattr(g, "proxy_upstream_response", False):
+                return response
+
+            allowed_headers = {header.lower() for header in self.allowed_headers}
+            gateway_response_headers = {"content-type", "content-length"}
             filtered_headers = {
                 key: value
                 for key, value in response.headers.items()
-                if key in self.allowed_headers
+                if key.lower() in allowed_headers
+                or key.lower() in gateway_response_headers
             }
-
             response.headers.clear()
-
             for key, value in filtered_headers.items():
                 response.headers.add_header(key, value)
-
             return response
 
     def register_service(self, base_url: str, deploy_path: str, csrf_exempt: bool = True):
@@ -581,10 +762,8 @@ class LimiterService(GatewayService, Limiter):
             app (Flask): The Flask application to register the hooks with.
         """
 
-        @app.before_request
-        def _before_request_hook():
-            g.request_start_time = time.time()
-
+        # Request timing starts in the decorated admission wrapper so it includes
+        # completed handler work and is associated with the exact admitted limits.
         def _token_authenticated(sender, token=None, **kwargs):
             client = OAuth2Client.query.filter_by(id=token.client_id).first()
             level = getattr(client, "ratelimit", 1.0) if client else 0.0
@@ -666,6 +845,7 @@ class LimiterService(GatewayService, Limiter):
         if request_endpoint == "*":
             self._logger.info("Clearing all limits")
             self.reset()
+            extensions.storage_service.delete_prefix(f"{self._name}//")
         else:
             defaults, decorated = self.limit_manager.resolve_limits(self._app, request_endpoint)
             all_limits = list(defaults) + list(decorated)
@@ -675,7 +855,7 @@ class LimiterService(GatewayService, Limiter):
                 self.storage.clear(key)
 
             extensions.storage_service.delete(
-                f"{self._name}//{self._key_func(request_endpoint)}/time"
+                f"{self._name}//{self._key_func(request_endpoint)}/total_microseconds"
             )
             extensions.storage_service.delete(
                 f"{self._name}//{self._key_func(request_endpoint)}/count"
@@ -698,6 +878,8 @@ class LimiterService(GatewayService, Limiter):
         if limit_value is None and (counts is None or per_second is None):
             raise ValueError("Either limit_value or counts and per_second must be provided")
 
+        adaptive_cost = cost is None
+
         def inner(func):
             LimitDecorator(
                 self,
@@ -713,17 +895,34 @@ class LimiterService(GatewayService, Limiter):
                 exempt_when=exempt_when,
                 override_defaults=override_defaults,
                 deduct_when=deduct_when,
-                cost=cost if cost else self._cost_func,
+                cost=cost if cost is not None else 1,
             )(func)
 
             @wraps(func)
             def check(*args, **kwargs):
+                started_ns = time.monotonic_ns()
                 self.check()
-                return func(*args, **kwargs)
+                result = func(*args, **kwargs)
+                if adaptive_cost and self._is_successful_response(result):
+                    self._record_completed_request(started_ns)
+                return result
 
             return check
 
         return inner
+
+    @staticmethod
+    def _is_successful_response(result) -> bool:
+        if isinstance(result, Response):
+            return result.status_code < 400
+        if (
+            isinstance(result, tuple)
+            and len(result) > 1
+            and isinstance(result[1], int)
+        ):
+            return result[1] < 400
+        return True
+
 
     def _calculate_limit_value(self, counts: int, per_second: int) -> str:
         """Calculates the limit string for the specified counts and per second values.
@@ -742,14 +941,9 @@ class LimiterService(GatewayService, Limiter):
         individual_multipliers = getattr(client, "individual_ratelimit_multipliers", None)
 
         if individual_multipliers:
-            multiplier = next(
-                (
-                    value
-                    for pattern, value in individual_multipliers.items()
-                    if re.match(pattern, request.endpoint)
-                ),
-                multiplier,
-            )
+            route_multiplier = individual_multipliers.get(request.endpoint)
+            if route_multiplier is not None:
+                multiplier = max(multiplier, route_multiplier)
 
         if request.endpoint in self._symbolic_ratelimits:
             counts: int = self._symbolic_ratelimits[request.endpoint]["counts"]
@@ -757,62 +951,55 @@ class LimiterService(GatewayService, Limiter):
 
         return "{0}/{1} second".format(int(counts * multiplier), per_second)
 
-    def _cost_func(self) -> int:
-        """Calculates the cost for the rate limit.
-
-        This method calculates the cost for the rate limit based on the processing time of the request.
-
-        Returns:
-            int: The cost for the rate limit.
-        """
-
-        self._calc_new_mean_time()
-
-        if self.get_service_config("SCALING_COST_ENABLED", False):
-
-            request_count = float(
-                extensions.storage_service.get(f"{self._name}//{self._key_func()}/count") or 0
+    def _record_completed_request(self, started_ns: int) -> int:
+        if not self.get_service_config("SCALING_COST_ENABLED", False):
+            return 1
+        max_seconds = max(
+            float(self.get_service_config("MAX_ACCOUNTED_SECONDS", 60)), 0.0
+        )
+        elapsed_us = min(
+            max((time.monotonic_ns() - started_ns) // 1000, 0),
+            int(max_seconds * 1_000_000),
+        )
+        g.processing_time = elapsed_us / 1_000_000
+        threshold = max(
+            int(self.get_service_config("SCALING_COST_THRESHOLD", 100)), 0
+        )
+        max_cost = max(int(self.get_service_config("MAX_COST", 10)), 1)
+        ttl = max(
+            int(self.get_service_config("ESTIMATOR_TTL_SECONDS", 600)), 1
+        )
+        highest_cost = 1
+        for request_limit in self.current_limits:
+            effective_key = json.dumps(
+                [str(request_limit.key), str(request_limit.scope)],
+                separators=(",", ":"),
             )
-
-            if request_count > self.get_service_config("SCALING_COST_THRESHOLD", 100):
-
-                request_mean_time = float(
-                    extensions.storage_service.get(f"{self._name}//{self._key_func()}/time") or 0
+            aggregate = (
+                f"{self._name}//adaptive/"
+                f"{hashlib.sha256(effective_key.encode('utf-8')).hexdigest()}"
+            )
+            total_us, completed_count = extensions.storage_service.atomic_snapshot_and_add(
+                f"{aggregate}/total_microseconds",
+                f"{aggregate}/count",
+                elapsed_us,
+                ttl,
+            )
+            cost = 1
+            if completed_count >= threshold and completed_count > 0 and total_us > 0:
+                mean_us = total_us / completed_count
+                if mean_us > 0 and elapsed_us > mean_us:
+                    scaled = math.floor(math.log2(elapsed_us / mean_us) * 5)
+                    cost = 1 + min(max(scaled, 0), max_cost - 1)
+            surcharge = cost - 1
+            if surcharge:
+                self.limiter.hit(
+                    request_limit.limit,
+                    *request_limit.request_args,
+                    cost=surcharge,
                 )
-
-                request_time = getattr(g, "processing_time", 0)
-
-                if request_time <= request_mean_time:
-                    return 1
-
-                # Calculate the ratio of processing time to mean time
-                ratio = request_time / request_mean_time
-
-                # Calculate the cost based on the log2 of the ratio
-                #
-                # Example:
-                # 1 + log(1, 2) * 5 = 1 + 0 = 1
-                # 1 + log(2, 2) * 5 = 1 + 1 * 5 = 6
-                # 1 + log(3, 2) * 5 ≈ 1 + 1.585 * 5 ≈ 9.925
-                return 1 + min(int(math.log(ratio, 2) * 5), 9)
-
-        return 1
-
-    def _calc_new_mean_time(self):
-        processing_time: float = max(0.0, time.time() - g.request_start_time)
-
-        key_time: str = f"{self._name}//{self._key_func()}/time"
-        key_count: str = f"{self._name}//{self._key_func()}/count"
-
-        existing_time: float = float(extensions.storage_service.get(key_time) or 0)
-        request_count: int = int(extensions.storage_service.get(key_count) or 0)
-
-        new_mean_time = ((existing_time * request_count) + processing_time) / (request_count + 1)
-
-        extensions.storage_service.set(key_time, new_mean_time)
-        extensions.storage_service.set(key_count, request_count + 1)
-
-        g.processing_time = processing_time
+            highest_cost = max(highest_cost, cost)
+        return highest_cost
 
     def _key_func(self, request_endpoint=None) -> str:
         """Returns the key for the rate limit.
@@ -915,6 +1102,8 @@ class StorageService(GatewayService):
     def __init__(self, name: str = "STORAGE_SERVICE"):
         super().__init__(name)
         self._fallback_storage: dict = {}
+        self._fallback_lock = threading.RLock()
+        self._fallback_expirations: dict[str, float] = {}
 
     def init_app(self, app: Flask, redis_service: RedisService):
         super().init_app(app)
@@ -937,17 +1126,19 @@ class StorageService(GatewayService):
             return self._serializer.dumps(value)
 
     def _transfer_to_redis(self):
-        """
-        Transfers the data from the fallback storage to Redis.
-
-        This method iterates over the items in the fallback storage and transfers them to Redis.
-        After the transfer is complete, the fallback storage is cleared.
-        """
+        """Transfer unexpired fallback values to Redis."""
+        now = time.monotonic()
         for key, value in self._fallback_storage.items():
+            expiration = self._fallback_expirations.get(key)
+            if expiration is not None and expiration <= now:
+                continue
             if isinstance(value, dict):
                 value = json.dumps(value)
             self._redis_service.set(key, self._serialize(value))
+            if expiration is not None:
+                self._redis_service.expire(key, max(math.ceil(expiration - now), 1))
         self._fallback_storage.clear()
+        self._fallback_expirations.clear()
 
     def handle_redis_exception(func):
         def wrapper(self, *args, **kwargs):
@@ -998,6 +1189,7 @@ class StorageService(GatewayService):
         if not self._redis_down:
             return bool(self._redis_service.delete(key))
         else:
+            self._fallback_expirations.pop(key, None)
             return bool(self._fallback_storage.pop(key, None))
 
     @handle_redis_exception
@@ -1015,6 +1207,62 @@ class StorageService(GatewayService):
         else:
             self._fallback_storage[key] = self._fallback_storage.get(key, 0) + increment
             return self._fallback_storage[key]
+
+    @handle_redis_exception
+    def delete_prefix(self, prefix: str) -> int:
+        if not self._redis_down:
+            keys = list(self._redis_service.scan_iter(match=f"{prefix}*"))
+            return int(self._redis_service.delete(*keys)) if keys else 0
+        with self._fallback_lock:
+            keys = [key for key in self._fallback_storage if key.startswith(prefix)]
+            for key in keys:
+                del self._fallback_storage[key]
+                self._fallback_expirations.pop(key, None)
+            return len(keys)
+
+    @handle_redis_exception
+    def atomic_snapshot_and_add(
+        self,
+        total_key: str,
+        count_key: str,
+        elapsed_microseconds: int,
+        ttl_seconds: int,
+    ) -> tuple[int, int]:
+        """Return the prior aggregate, add a sample, and refresh the rolling TTL."""
+        ttl_seconds = max(int(ttl_seconds), 1)
+        if not self._redis_down:
+            script = """
+                local total = tonumber(redis.call('GET', KEYS[1]) or '0')
+                local count = tonumber(redis.call('GET', KEYS[2]) or '0')
+                redis.call('INCRBY', KEYS[1], ARGV[1])
+                redis.call('INCRBY', KEYS[2], 1)
+                redis.call('EXPIRE', KEYS[1], ARGV[2])
+                redis.call('EXPIRE', KEYS[2], ARGV[2])
+                return {total, count}
+            """
+            total, count = self._redis_service.eval(
+                script,
+                2,
+                total_key,
+                count_key,
+                int(elapsed_microseconds),
+                ttl_seconds,
+            )
+            return int(total), int(count)
+        with self._fallback_lock:
+            now = time.monotonic()
+            if self._fallback_expirations.get(total_key, 0) <= now:
+                self._fallback_storage.pop(total_key, None)
+            if self._fallback_expirations.get(count_key, 0) <= now:
+                self._fallback_storage.pop(count_key, None)
+            total = int(self._fallback_storage.get(total_key, 0))
+            count = int(self._fallback_storage.get(count_key, 0))
+            self._fallback_storage[total_key] = total + int(elapsed_microseconds)
+            self._fallback_storage[count_key] = count + 1
+            expiration = now + ttl_seconds
+            self._fallback_expirations[total_key] = expiration
+            self._fallback_expirations[count_key] = expiration
+            return total, count
 
     @handle_redis_exception
     def incrbyfloat(self, key: str, increment: float) -> float:
@@ -1152,11 +1400,31 @@ class CacheService(GatewayService, Cache):
 class SecurityService(GatewayService, Security):
     """A service for managing user authentication and authorization.
 
-    This service provides methods for creating and managing users and roles, changing passwords and email addresses,
-    and generating and verifying email verification tokens.
+    This service creates and manages users and roles, changes credentials, and
+    issues and verifies purpose-bound account-action capabilities.
 
 
     """
+    ACCOUNT_ACTION_PURPOSES = frozenset(
+        ("password_reset", "verify_registration", "change_email")
+    )
+    _ACCOUNT_ACTION_SALT_CONFIG = {
+        "password_reset": "VERIFY_PASSWORD_SALT",
+        "verify_registration": "VERIFY_EMAIL_SALT",
+        "change_email": "VERIFY_EMAIL_SALT",
+    }
+    _ACCOUNT_ACTION_PAYLOAD_KEYS = frozenset(
+        (
+            "version",
+            "user_id",
+            "purpose",
+            "nonce",
+            "target_email",
+            "state_digest",
+        )
+    )
+    _ACCOUNT_ACTION_VERSION = 1
+
 
     def __init__(self, name: str = "SECURITY_SERVICE"):
         GatewayService.__init__(self, name)
@@ -1180,9 +1448,11 @@ class SecurityService(GatewayService, Security):
             anonymous_user=AnonymousUser,
         )
 
-        self._token_serializer = URLSafeTimedSerializer(self.get_service_config("SECRET_KEY"))
+        self._account_action_serializer = URLSafeSerializer(
+            self.get_service_config("SECRET_KEY")
+        )
 
-    def create_user(self, email: str, password: str, **kwargs) -> User:
+    def create_user(self, email: str, password: str, commit: bool = True, **kwargs) -> User:
         """Creates a new user with the specified email and password.
 
         Args:
@@ -1198,6 +1468,7 @@ class SecurityService(GatewayService, Security):
             User: The created user.
         """
 
+        email = canonicalize_email(email)
         email = self._mail_util.validate(email)
         pbad, password = self._password_util.validate(password, True)
 
@@ -1206,7 +1477,10 @@ class SecurityService(GatewayService, Security):
 
         # Passwords are hashed in the setter of the model. No need to do it here.
         user = self.datastore.create_user(email=email, password=password, **kwargs)
-        self.datastore.commit()
+        if commit:
+            self.datastore.commit()
+        else:
+            self.datastore.db.session.flush()
 
         return user
 
@@ -1241,30 +1515,25 @@ class SecurityService(GatewayService, Security):
         else:
             return False
 
-    def change_password(self, user: User, password: str) -> User:
-        """
-        Change the password for a given user.
-
-        Args:
-            user (User): The user object for which to change the password.
-            password (str): The new password to set for the user.
-
-        Raises:
-            ValueError: If the new password is invalid.
-
-        Returns:
-            User: The updated user object.
-        """
+    def set_password_in_transaction(self, user: User, password: str) -> User:
+        """Validate and hash a password without committing the caller's transaction."""
         pbad, password = self._password_util.validate(password, True)
-
         if pbad is not None:
             raise ValueError(", ".join(pbad))
-
-        user = self.datastore.db.session.merge(user)
         user.password = password
-        self.datastore.commit()
-
         return user
+
+    def change_password(
+        self, user: User, password: str, *, session=None, commit: bool = True
+    ) -> User:
+        """Change a password within either this service's or the caller's transaction."""
+        transaction = session or self.datastore.db.session
+        user = transaction.merge(user)
+        self.set_password_in_transaction(user, password)
+        if commit:
+            transaction.commit()
+        return user
+
 
     def validate_email(self, email: str) -> bool:
         """
@@ -1277,123 +1546,305 @@ class SecurityService(GatewayService, Security):
             bool: True if the email address is valid, False otherwise.
         """
         try:
-            self._mail_util.validate(email)
+            self._mail_util.validate(canonicalize_email(email))
         except Exception:
             return False
 
         return True
 
-    def change_email(self, user: User, email: str) -> User:
-        """
-        Change the email of a user.
 
-        Args:
-            user (User): The user object to update.
-            email (str): The new email address for the user.
 
-        Returns:
-            User: The updated user object.
-        """
-        email = self._mail_util.validate(email)
-
-        user = self.datastore.db.session.merge(user)
-        user.email = email
-        self.datastore.commit()
-
-        return user
-
-    def generate_email_token(self, user_id: str = None) -> str:
-        """
-        Generate an email verification token for the provided user.
-
-        If no user id is provided, the current user is used.
-
-        Returns:
-            str: The email verification token.
-        """
-        if user_id is None:
-            user_id = current_user.id
-
-        return self.generate_token(user_id, salt=self.get_service_config("VERIFY_EMAIL_SALT"))
-
-    def generate_password_token(self, user_id: str = None) -> str:
-        """
-        Generate a password reset token for the current user.
-
-        Returns:
-            str: The password reset token.
-        """
-
-        if user_id is None:
-            user_id = current_user.id
-        current_app.logger.info("Generating password token for user: {}".format(user_id))
-
-        return self.generate_token(user_id, salt=self.get_service_config("VERIFY_PASSWORD_SALT"))
-
-    def generate_token(self, content: str, salt: str):
-        """
-        Generate a token for the given content and salt.
-
-        Returns:
-            str: The generated token.
-        """
-        return self._token_serializer.dumps(content, salt=salt)
-
-    def verify_password_token(self, token: str) -> User:
-        """
-        Verifies the password reset token and returns the associated user.
-
-        Args:
-            token (str): The password reset token to verify.
-
-        Returns:
-            User: The user associated with the token if it's valid, None otherwise.
-        """
-        salt = self.get_service_config("VERIFY_PASSWORD_SALT")
-        return self.verify_token(token, salt)
-
-    def verify_email_token(self, token: str) -> User:
-        """
-        Verifies the email confirmation token and returns the associated user.
-
-        Args:
-            token (str): The email confirmation token to verify.
-
-        Returns:
-            User: The user associated with the token if it's valid, None otherwise.
-        """
-        salt = self.get_service_config("VERIFY_EMAIL_SALT")
-        return self.verify_token(token, salt)
-
-    def verify_token(self, token: str, salt: str) -> User:
-        """
-        Verify email token and return the User object associated with the token.
-
-        Args:
-            token (str): The email verification token.
-
-        Raises:
-            ValueError: If the token is invalid or expired.
-            NotFoundError: If no user is associated with the verification token.
-            ValueError: If the user's email has already been validated.
-
-        Returns:
-            User: The user object associated with the verification token.
-        """
+    @staticmethod
+    def account_action_token_digest(token: str) -> str:
+        """Return the complete bearer token's SHA-256 digest."""
+        if not isinstance(token, str) or not token or len(token) > 4096:
+            raise AccountActionTokenError()
         try:
-            user_id = self._token_serializer.loads(token, max_age=86400, salt=salt)
-        except Exception as ex:
-            self._logger.warning(
-                "{0} verification token not validated. Reason: {1}".format(token, ex)
+            return hashlib.sha256(token.encode("utf-8")).hexdigest()
+        except UnicodeError:
+            raise AccountActionTokenError()
+
+    @staticmethod
+    def _utc_datetime(value: datetime) -> datetime:
+        if not isinstance(value, datetime):
+            raise AccountActionTokenError()
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+    @staticmethod
+    def normalize_account_email(email: str) -> str:
+        if not isinstance(email, str):
+            raise ValueError("account actions require an email target")
+        try:
+            normalized = canonicalize_email(email)
+        except ValueError as exc:
+            raise ValueError("account actions require a canonical email target") from exc
+        if len(normalized) > 255:
+            raise ValueError("account actions require a bounded email target")
+        return normalized
+
+    def _account_action_state_digest(self, user: User, purpose: str) -> str:
+        state = json.dumps(
+            {
+                "active": bool(user.active),
+                "confirmed": user.confirmed_at is not None,
+                "email": self.normalize_account_email(str(user.email)),
+                "password": user.password or "",
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hmac.new(
+            self._account_action_salt(purpose).encode("utf-8"),
+            state,
+            hashlib.sha256,
+        ).hexdigest()
+
+    def _validate_account_action_target(self, target_email) -> str:
+        return self.normalize_account_email(target_email)
+
+    def _account_action_salt(self, purpose: str) -> str:
+        config_key = self._ACCOUNT_ACTION_SALT_CONFIG.get(purpose)
+        if config_key is None:
+            raise AccountActionTokenError()
+        configured_salt = self.get_service_config(config_key)
+        return "account-action:{}:{}".format(purpose, configured_salt)
+
+    def issue_account_action_token(
+        self,
+        session,
+        *,
+        user: User = None,
+        user_id: int = None,
+        purpose: str,
+        target_email,
+        now: datetime = None,
+    ) -> str:
+        """Issue and persist one target-bound account-action capability."""
+        if (user is None) == (user_id is None):
+            raise ValueError("provide exactly one of user or user_id")
+        if user is not None:
+            user_id = user.id
+        if type(user_id) is not int or user_id <= 0:
+            raise ValueError("account action tokens require a persisted user")
+        if purpose not in self.ACCOUNT_ACTION_PURPOSES:
+            raise ValueError("unknown account action purpose")
+        target_email = self._validate_account_action_target(target_email)
+
+        locked_user = (
+            session.query(User)
+            .populate_existing()
+            .filter(User.id == user_id)
+            .with_for_update()
+            .one_or_none()
+        )
+        if locked_user is None:
+            raise ValueError("account action user does not exist")
+        current_email = self.normalize_account_email(str(locked_user.email))
+        if locked_user.is_anonymous_bootstrap_user or not locked_user.active:
+            raise ValueError("user is not eligible for account actions")
+        if purpose == "password_reset":
+            if locked_user.confirmed_at is None:
+                raise ValueError("user is not eligible for password reset")
+            if target_email != current_email:
+                raise ValueError("password reset target does not match the user")
+        elif purpose == "verify_registration":
+            if locked_user.confirmed_at is not None or target_email != current_email:
+                raise ValueError("user is not eligible for registration verification")
+        elif locked_user.confirmed_at is None or target_email == current_email:
+            raise ValueError("user is not eligible for email change")
+        state_digest = self._account_action_state_digest(locked_user, purpose)
+
+        issued_at = self._utc_datetime(now or datetime.now(timezone.utc))
+        expires_in = self.get_service_config(
+            "ACCOUNT_ACTION_TOKEN_EXPIRES", 24 * 60 * 60
+        )
+        if type(expires_in) is not int or expires_in <= 0:
+            raise ValueError("account action token expiry must be a positive integer")
+        expires_at = issued_at + timedelta(seconds=expires_in)
+        delivery_id = str(uuid.uuid4())
+        token = self._serialize_account_action_token(
+            user_id=locked_user.id,
+            purpose=purpose,
+            target_email=target_email,
+            state_digest=state_digest,
+            delivery_id=delivery_id,
+        )
+
+        session.query(AccountActionToken).filter(
+            AccountActionToken.user_id == locked_user.id,
+            AccountActionToken.purpose == purpose,
+        ).delete(synchronize_session=False)
+        session.add(
+            AccountActionToken(
+                delivery_id=delivery_id,
+                token_digest=self.account_action_token_digest(token),
+                user_id=locked_user.id,
+                purpose=purpose,
+                target_email=target_email,
+                state_digest=state_digest,
+                issued_at=issued_at,
+                expires_at=expires_at,
             )
-            raise ValueError("unknown verification token")
-        current_app.logger.info("Verifying token for user: {}".format(user_id))
-        user: User = User.query.filter_by(id=user_id).first()
+        )
+        session.flush()
+        return token
 
+    def _account_action_nonce(self, purpose: str, delivery_id: str) -> str:
+        return hmac.new(
+            self._account_action_salt(purpose).encode("utf-8"),
+            delivery_id.encode("ascii"),
+            hashlib.sha256,
+        ).hexdigest()
+
+    def _serialize_account_action_token(
+        self,
+        *,
+        user_id: int,
+        purpose: str,
+        target_email: str,
+        state_digest: str,
+        delivery_id: str,
+    ) -> str:
+        payload = {
+            "version": self._ACCOUNT_ACTION_VERSION,
+            "user_id": user_id,
+            "purpose": purpose,
+            "nonce": self._account_action_nonce(purpose, delivery_id),
+            "target_email": target_email,
+            "state_digest": state_digest,
+        }
+        return self._account_action_serializer.dumps(
+            payload, salt=self._account_action_salt(purpose)
+        )
+
+    def derive_account_action_token(self, action: AccountActionToken) -> str:
+        """Derive a bearer in memory from the exact persisted action."""
+        token = self._serialize_account_action_token(
+            user_id=action.user_id,
+            purpose=action.purpose,
+            target_email=action.target_email,
+            state_digest=action.state_digest,
+            delivery_id=action.delivery_id,
+        )
+        if not hmac.compare_digest(
+            self.account_action_token_digest(token), action.token_digest
+        ):
+            raise AccountActionTokenError()
+        return token
+
+    def _decode_account_action_token(self, token: str, purpose: str) -> dict:
+        if purpose not in self.ACCOUNT_ACTION_PURPOSES:
+            raise AccountActionTokenError()
+        if not isinstance(token, str) or not token or len(token) > 4096:
+            raise AccountActionTokenError()
+        try:
+            payload = self._account_action_serializer.loads(
+                token, salt=self._account_action_salt(purpose)
+            )
+        except Exception:
+            self._logger.warning("Account action token rejected")
+            raise AccountActionTokenError()
+        if type(payload) is not dict or set(payload) != self._ACCOUNT_ACTION_PAYLOAD_KEYS:
+            raise AccountActionTokenError()
+        if (
+            type(payload["version"]) is not int
+            or payload["version"] != self._ACCOUNT_ACTION_VERSION
+        ):
+            raise AccountActionTokenError()
+        if type(payload["user_id"]) is not int or payload["user_id"] <= 0:
+            raise AccountActionTokenError()
+        if payload["purpose"] != purpose:
+            raise AccountActionTokenError()
+        nonce = payload["nonce"]
+        if (
+            not isinstance(nonce, str)
+            or not 32 <= len(nonce) <= 128
+            or re.fullmatch(r"[A-Za-z0-9_-]+", nonce) is None
+        ):
+            raise AccountActionTokenError()
+        try:
+            self._validate_account_action_target(payload["target_email"])
+        except ValueError:
+            raise AccountActionTokenError()
+        state_digest = payload["state_digest"]
+        if (
+            not isinstance(state_digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", state_digest) is None
+        ):
+            raise AccountActionTokenError()
+        return payload
+
+    def verify_account_action_token(
+        self,
+        session,
+        token: str,
+        purpose: str,
+        *,
+        for_update: bool = False,
+        now: datetime = None,
+    ) -> Tuple[User, AccountActionToken]:
+        """Verify a capability and return its locked or read-only state."""
+        payload = self._decode_account_action_token(token, purpose)
+        user_query = session.query(User).filter(User.id == payload["user_id"])
+        user_query = user_query.populate_existing()
+        if for_update:
+            user_query = user_query.with_for_update()
+        user = user_query.one_or_none()
         if user is None:
-            raise NotFoundError("no user associated with that verification token")
+            raise AccountActionTokenError()
 
-        return user
+        digest = self.account_action_token_digest(token)
+        action_query = (
+            session.query(AccountActionToken)
+            .filter(AccountActionToken.token_digest == digest)
+            .populate_existing()
+        )
+        if for_update:
+            action_query = action_query.with_for_update()
+        action = action_query.one_or_none()
+        if (
+            action is None
+            or action.user_id != user.id
+            or action.purpose != purpose
+            or action.target_email != payload["target_email"]
+            or not isinstance(action.state_digest, str)
+            or not hmac.compare_digest(
+                action.state_digest, payload["state_digest"]
+            )
+        ):
+            raise AccountActionTokenError()
+
+        try:
+            current_state_digest = self._account_action_state_digest(user, purpose)
+            current_email = self.normalize_account_email(str(user.email))
+        except (TypeError, ValueError):
+            raise AccountActionTokenError()
+        if not hmac.compare_digest(current_state_digest, action.state_digest):
+            raise AccountActionTokenError()
+        if not user.active or user.is_anonymous_bootstrap_user:
+            raise AccountActionTokenError()
+        if purpose == "password_reset" and (
+            user.confirmed_at is None or current_email != action.target_email
+        ):
+            raise AccountActionTokenError()
+        if purpose == "verify_registration" and (
+            user.confirmed_at is not None or current_email != action.target_email
+        ):
+            raise AccountActionTokenError()
+        if purpose == "change_email" and (
+            user.confirmed_at is None or current_email == action.target_email
+        ):
+            raise AccountActionTokenError()
+
+        checked_at = self._utc_datetime(now or datetime.now(timezone.utc))
+        issued_at = self._utc_datetime(action.issued_at)
+        expires_at = self._utc_datetime(action.expires_at)
+        if issued_at >= expires_at or checked_at >= expires_at:
+            raise AccountActionTokenError()
+        return user, action
+
 
 
 class KafkaProducerService(GatewayService):

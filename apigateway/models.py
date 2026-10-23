@@ -1,3 +1,6 @@
+import uuid
+
+from datetime import datetime
 from typing import List
 
 import sqlalchemy as sa
@@ -102,43 +105,94 @@ class Role(base_model, RoleMixin):
 
 class OAuth2Client(base_model, OAuth2ClientMixin):
     __tablename__ = "oauth2client"
+    __table_args__ = (
+        sa.CheckConstraint(
+            "credential_purpose IN ('anonymous', 'browser', 'personal', 'operator')",
+            name="ck_oauth2client_credential_purpose",
+        ),
+        sa.CheckConstraint(
+            "(credential_purpose = 'anonymous' AND binding_digest IS NOT NULL) "
+            "OR (credential_purpose <> 'anonymous' AND binding_digest IS NULL)",
+            name="ck_oauth2client_anonymous_binding",
+        ),
+        sa.Index(
+            "uq_oauth2client_active_personal_owner",
+            "user_id",
+            unique=True,
+            postgresql_where=sa.text("credential_purpose = 'personal'"),
+            sqlite_where=sa.text("credential_purpose = 'personal'"),
+        ),
+    )
 
     id = sa.Column(sa.Integer, primary_key=True, autoincrement=True)
     user_id = sa.Column(
-        sa.String, sa.ForeignKey("user.fs_uniquifier", ondelete="CASCADE"), index=True
+        sa.String,
+        sa.ForeignKey("user.fs_uniquifier", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
-    ratelimit_multiplier = sa.Column(sa.Float, default=1.0)
+    # This deployment is a bearer resource server; clients are public
+    # identifiers and never have a stored or issued client secret.
+    client_secret = None
+    client_secret_expires_at = None
+    ratelimit_multiplier = sa.Column(sa.Float, nullable=False, default=1.0)
     individual_ratelimit_multipliers = sa.Column(sa.JSON)
     last_activity = sa.Column(sa.DateTime, nullable=True)
+    credential_purpose = sa.Column(sa.String(16), nullable=False, default="browser")
+    binding_digest = sa.Column(sa.String(64), nullable=True, index=True)
 
     user = relationship("User")
 
     def gen_salt(self):
         self.reset_client_id()
-        self.reset_client_secret()
 
     def reset_client_id(self):
         self.client_id = gen_salt(current_app.config.get("OAUTH2_CLIENT_ID_SALT_LEN"))
 
-    def reset_client_secret(self):
-        self.client_secret = gen_salt(current_app.config.get("OAUTH2_CLIENT_SECRET_SALT_LEN"))
-
 
 class OAuth2Token(base_model, OAuth2TokenMixin):
     __tablename__ = "oauth2token"
+    __table_args__ = (
+        sa.CheckConstraint(
+            "credential_purpose IN ('anonymous', 'browser', 'personal', 'operator')",
+            name="ck_oauth2token_credential_purpose",
+        ),
+        sa.CheckConstraint(
+            "token_digest_version = 1", name="ck_oauth2token_digest_version"
+        ),
+        sa.UniqueConstraint(
+            "token_key_id",
+            "access_token",
+            name="uq_oauth2token_key_digest",
+        ),
+    )
 
     id = sa.Column(sa.Integer, primary_key=True, autoincrement=True)
     user_id = sa.Column(
-        sa.String, sa.ForeignKey("user.fs_uniquifier", ondelete="CASCADE"), index=True
+        sa.String,
+        sa.ForeignKey("user.fs_uniquifier", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     user = relationship("User")
     client_id = sa.Column(
-        sa.Integer(), sa.ForeignKey("oauth2client.id", ondelete="CASCADE"), index=True
+        sa.Integer(),
+        sa.ForeignKey("oauth2client.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     client = relationship("OAuth2Client")
+    # OAuth2TokenMixin's access_token column stores only the keyed digest.
+    # Raw bearer credentials exist only in the issuance response.
+    access_token = sa.Column(sa.String(64), nullable=False)
+    refresh_token = None
+    refresh_token_revoked_at = None
+    token_key_id = sa.Column(sa.String(64), nullable=False)
+    token_digest_version = sa.Column(sa.SmallInteger, nullable=False, default=1)
+    credential_purpose = sa.Column(sa.String(16), nullable=False, default="browser")
     is_personal = sa.Column(sa.Boolean, default=False, index=True)
     is_internal = sa.Column(sa.Boolean, default=False)
-    expires_in = sa.Column(sa.BigInteger, nullable=False, default=0)
+    expires_in = sa.Column(sa.BigInteger, nullable=False)
 
     def expires_at(self):
         if not self.expires_in:
@@ -147,20 +201,53 @@ class OAuth2Token(base_model, OAuth2TokenMixin):
         return self.issued_at + self.expires_in
 
 
-class EmailChangeRequest(base_model):
-    __tablename__ = "email_change_request"
+
+class AccountActionToken(base_model):
+    __tablename__ = "account_action_token"
+    __table_args__ = (
+        sa.CheckConstraint(
+            "purpose IN ('password_reset', 'verify_registration', 'change_email')",
+            name="ck_account_action_token_purpose",
+        ),
+        sa.UniqueConstraint(
+            "user_id", "purpose", name="uq_account_action_token_user_purpose"
+        ),
+    )
 
     id = sa.Column(sa.Integer, primary_key=True, autoincrement=True)
-    token = sa.Column(sa.String(255), unique=True)
-    user_id = sa.Column(sa.Integer(), sa.ForeignKey("user.id", ondelete="CASCADE"))
+    delivery_id = sa.Column(
+        sa.String(36), unique=True, nullable=False, default=lambda: str(uuid.uuid4())
+    )
+    token_digest = sa.Column(sa.String(64), nullable=False, unique=True, index=True)
+    user_id = sa.Column(
+        sa.Integer,
+        sa.ForeignKey("user.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    purpose = sa.Column(sa.String(32), nullable=False)
+    target_email = sa.Column(sa.String(255), nullable=False)
+    state_digest = sa.Column(sa.String(64), nullable=False)
+    issued_at = sa.Column(sa.DateTime(timezone=True), nullable=False)
+    expires_at = sa.Column(sa.DateTime(timezone=True), nullable=False)
     user = relationship("User")
-    new_email = sa.Column(sa.Text)
 
 
-class PasswordChangeRequest(base_model):
-    __tablename__ = "password_change_request"
+class NotificationOutbox(base_model):
+    __tablename__ = "notification_outbox"
 
     id = sa.Column(sa.Integer, primary_key=True, autoincrement=True)
-    token = sa.Column(sa.String(255), unique=True)
-    user_id = sa.Column(sa.Integer(), sa.ForeignKey("user.id", ondelete="CASCADE"))
-    user = relationship("User")
+    event_type = sa.Column(sa.String(64), nullable=False)
+    payload = sa.Column(sa.JSON, nullable=False)
+    payload_size = sa.Column(sa.Integer, nullable=False, default=0)
+    state = sa.Column(sa.String(24), nullable=False, default="pending", index=True)
+    attempts = sa.Column(sa.Integer, nullable=False, default=0)
+    available_at = sa.Column(sa.DateTime, nullable=False, default=datetime.utcnow, index=True)
+    claimed_at = sa.Column(sa.DateTime)
+    ownership_token = sa.Column(sa.String(36), index=True)
+    dedupe_key = sa.Column(sa.String(320), unique=True)
+    last_error = sa.Column(sa.String(64))
+    terminal_at = sa.Column(sa.DateTime, index=True)
+    created_at = sa.Column(sa.DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = sa.Column(
+        sa.DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow
+    )

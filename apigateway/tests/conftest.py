@@ -1,3 +1,4 @@
+import os
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -11,10 +12,12 @@ from apigateway.models import base_model
 def app(request):
     app = create_app(
         **{
-            "SQLALCHEMY_DATABASE_URI": "sqlite:///:memory:",
+            "SQLALCHEMY_DATABASE_URI": os.environ.get(
+                "TEST_DATABASE_URI", "sqlite:///:memory:"
+            ),
             "SQLALCHEMY_ECHO": False,
             "TESTING": True,
-            "DEBUG": True,
+            "DEBUG": False,
             "PROPAGATE_EXCEPTIONS": True,
             "TRAP_BAD_REQUEST_ERRORS": True,
             "PRESERVE_CONTEXT_ON_EXCEPTION": False,
@@ -22,7 +25,36 @@ def app(request):
             "BOOTSTRAP_TOKEN_EXPIRES": 3600,
             "PROXY_SERVICE_ALLOWED_HEADERS": ["test_allowed_header"],
             "LIMITER_SERVICE_SCALING_COST_ENABLED": False,
+            "SECRET_KEY": "flask-test-signing-key-32-bytes-minimum",
+            "SECRET_KEY_ENCODING": "utf-8",
+            "SECURITY_SERVICE_SECRET_KEY": "serializer-test-key-32-bytes-minimum",
+            "SECURITY_SERVICE_VERIFY_PASSWORD_SALT": (
+                "password-test-purpose-salt-32-bytes-minimum"
+            ),
+            "SECURITY_SERVICE_VERIFY_EMAIL_SALT": (
+                "email-test-purpose-salt-32-bytes-minimum"
+            ),
+            "SECURITY_SERVICE_ACCOUNT_ACTION_TOKEN_EXPIRES": 24 * 60 * 60,
+            "GOOGLE_RECAPTCHA_PRIVATE_KEY": "explicit-test-recaptcha-key",
+            "RECAPTCHA_TEST_BYPASS": True,
+            "MAIL_TEST_BYPASS": True,
+            "TRUSTED_HOSTS": ["localhost", "scixplorer.org"],
+            "SITE_HOST_MAPPING": {
+                "localhost": "ADS",
+                "scixplorer.org": "SCIX",
+            },
+            "CORS_DOMAINS": [
+                "https://ui.adsabs.harvard.edu",
+                "https://scixplorer.org",
+            ],
+            "HTTPS_ENFORCEMENT": False,
+            "TRUSTED_PROXY_HOPS": 0,
+            "SECURITY_EMAIL_VALIDATOR_ARGS": {"check_deliverability": False},
+            "SESSION_COOKIE_SECURE": False,
+            "SESSION_COOKIE_HTTPONLY": True,
+            "SESSION_COOKIE_SAMESITE": "Lax",
         },
+        allow_insecure_test_config=True,
         name=request.node.name,
     )
 
@@ -165,23 +197,3 @@ def mock_proxy_view():
     with patch("flask.views.View.as_view", return_value=MagicMock()) as mock_view:
         yield mock_view
 
-
-@pytest.fixture()
-def mock_add_arguments():
-    with patch("argparse.ArgumentParser.parse_args") as mock_args:
-        mock_args.return_value.user_email = "test@gmail.com"
-        mock_args.return_value.description = "Test Description"
-        mock_args.return_value.name = "Test OAuth Client"
-        mock_args.return_value.create_user = False
-        mock_args.return_value.scopes = ["user", "api"]
-        mock_args.return_value.is_personal = False
-        yield mock_args
-
-
-@pytest.fixture()
-def mock_simple_token():
-    mock_token = MagicMock()
-    mock_token.access_token = "access_token"
-    mock_token.refresh_token = "refresh_token"
-    mock_token.scope = "user api"
-    return mock_token

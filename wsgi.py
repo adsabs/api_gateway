@@ -1,25 +1,17 @@
 from werkzeug.middleware.dispatcher import DispatcherMiddleware
-from werkzeug.serving import run_simple
 from werkzeug.wrappers import Response
 from opentelemetry.instrumentation.flask import FlaskInstrumentor
 from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
 
-from apigateway.app import create_app
+from apigateway.app import create_app, sanitize_telemetry_request
 
-app = create_app()
-FlaskInstrumentor.instrument_app(app)
+_gateway = create_app()
+FlaskInstrumentor.instrument_app(
+    _gateway, request_hook=sanitize_telemetry_request
+)
 
-SQLAlchemyInstrumentor().instrument(engine=app.db.engine)
+with _gateway.app_context():
+    SQLAlchemyInstrumentor().instrument(engine=_gateway.db.engine)
 
-application = DispatcherMiddleware(Response("Not Found", status=404), {"/v1": app})
-
-if __name__ == "__main__":
-
-    run_simple(
-        "0.0.0.0",
-        8181,
-        application,
-        use_reloader=True,
-        use_debugger=False,
-        threaded=True,
-    )
+application = DispatcherMiddleware(Response("Not Found", status=404), {"/v1": _gateway})
+del _gateway
